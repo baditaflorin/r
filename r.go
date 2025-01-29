@@ -21,6 +21,60 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+// Add this to r.go at the top level
+
+// LogConfig defines configuration options for logging
+type LogConfig struct {
+	// Output destination (file, stdout, etc)
+	Output io.Writer
+	// Log file path if writing to file
+	FilePath string
+	// Whether to use JSON format
+	JsonFormat bool
+	// Whether to write asynchronously
+	AsyncWrite bool
+	// Buffer size for async writing
+	BufferSize int
+	// Maximum size of log files before rotation
+	MaxFileSize int
+	// Maximum number of old log files to retain
+	MaxBackups int
+	// Whether to add source code location to log entries
+	AddSource bool
+	// Whether to collect metrics about logging
+	Metrics bool
+	// Minimum log level to output
+	Level LogLevel
+}
+
+// LogLevel represents the severity of a log entry
+type LogLevel int
+
+const (
+	DebugLevel LogLevel = iota
+	InfoLevel
+	WarnLevel
+	ErrorLevel
+	FatalLevel
+)
+
+func (l LogLevel) String() string {
+	switch l {
+	case DebugLevel:
+		return "debug"
+	case InfoLevel:
+		return "info"
+	case WarnLevel:
+		return "warn"
+	case ErrorLevel:
+		return "error"
+	case FatalLevel:
+		return "fatal"
+	default:
+		return "unknown"
+	}
+}
+
 // WSHandler defines the interface for WebSocket event handling
 type WSHandler interface {
 	OnConnect(conn WSConnection)
@@ -40,8 +94,126 @@ type WSConnection interface {
 }
 
 // Server defines the interface for the HTTP server
+// 1. Server Interface (expand existing)
 type Server interface {
 	Start(address string) error
+	Stop() error
+	// Add these new methods
+	WithConfig(config Config) Server
+	WithRouter(router Router) Server
+	WithMiddleware(middleware ...MiddlewareFunc) Server
+}
+
+type ConfigProvider interface {
+	GetConfig() Config
+	SetConfig(Config) error
+	LoadFromFile(path string) error
+	LoadFromEnv() error
+}
+
+type RouterProvider interface {
+	Router
+	WithMiddlewareProvider(provider MiddlewareProvider) RouterProvider
+	WithErrorHandler(handler ErrorHandler) RouterProvider
+	WithWSUpgrader(upgrader WSUpgrader) RouterProvider
+}
+
+type ContextFactory interface {
+	CreateContext(*fasthttp.RequestCtx) Context
+	WithStore(store Store) ContextFactory
+}
+
+type Store interface {
+	Get(key string) (interface{}, bool)
+	Set(key string, value interface{})
+	Delete(key string)
+	Clear()
+}
+
+type Logger interface {
+	// Keep existing methods
+	WithField(key string, value interface{}) Logger
+	WithFields(fields map[string]interface{}) Logger
+	WithError(err error) Logger
+	Configure(config LogConfig) error
+
+	// Add the Log method that's being used in standardMiddleware
+	Log(method string, status int, latency time.Duration, ip, path string)
+
+	// Add common logging methods for completeness
+	Info(msg string, args ...interface{})
+	Error(msg string, args ...interface{})
+	Debug(msg string, args ...interface{})
+	Warn(msg string, args ...interface{})
+}
+
+// Then implement a default logger that satisfies this interface
+type defaultLogger struct{}
+
+func NewDefaultLogger() Logger {
+	return &defaultLogger{}
+}
+
+func (l *defaultLogger) WithField(key string, value interface{}) Logger {
+	return l
+}
+
+func (l *defaultLogger) WithFields(fields map[string]interface{}) Logger {
+	return l
+}
+
+func (l *defaultLogger) WithError(err error) Logger {
+	return l
+}
+
+func (l *defaultLogger) Configure(config LogConfig) error {
+	return nil
+}
+
+func (l *defaultLogger) Log(method string, status int, latency time.Duration, ip, path string) {
+	fmt.Printf("%s | %3d | %13v | %15s | %s\n", method, status, latency, ip, path)
+}
+
+func (l *defaultLogger) Info(msg string, args ...interface{}) {
+	fmt.Printf("INFO: "+msg+"\n", args...)
+}
+
+func (l *defaultLogger) Error(msg string, args ...interface{}) {
+	fmt.Printf("ERROR: "+msg+"\n", args...)
+}
+
+func (l *defaultLogger) Debug(msg string, args ...interface{}) {
+	fmt.Printf("DEBUG: "+msg+"\n", args...)
+}
+
+func (l *defaultLogger) Warn(msg string, args ...interface{}) {
+	fmt.Printf("WARN: "+msg+"\n", args...)
+}
+
+type WSUpgrader interface {
+	Upgrade(*fasthttp.RequestCtx, WSHandler) (WSConnection, error)
+	WithConfig(WSConfig) WSUpgrader
+}
+
+// 8. Error Handler Interface (new)
+type ErrorHandler interface {
+	HandleError(Context, error)
+	HandlePanic(Context, interface{})
+	WithLogger(Logger) ErrorHandler
+}
+
+// 9. Metrics Interface (new)
+type MetricsCollector interface {
+	IncrementCounter(name string, tags map[string]string)
+	RecordTiming(name string, duration time.Duration)
+	CollectMetrics() map[string]interface{}
+}
+
+// 10. Health Checker Interface (new)
+type HealthChecker interface {
+	Check() error
+	RegisterCheck(name string, check func() error)
+	Start(context.Context) error
 	Stop() error
 }
 

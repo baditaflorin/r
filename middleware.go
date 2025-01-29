@@ -30,11 +30,6 @@ type RateLimiter interface {
 	Reset(key string)
 }
 
-// Logger defines the interface for custom logging implementations
-type Logger interface {
-	Log(method string, status int, latency time.Duration, ip, path string)
-}
-
 // SecurityProvider defines the interface for security header management
 type SecurityProvider interface {
 	SetHeaders(c Context)
