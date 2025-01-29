@@ -394,61 +394,6 @@ type Router interface {
 
 type PanicHandlerFunc func(Context, interface{})
 
-// Recovery middleware
-func Recovery() MiddlewareFunc {
-	return func(c Context) {
-		defer func() {
-			if rcv := recover(); rcv != nil {
-				if h := c.(*contextImpl).router.panicHandler; h != nil {
-					h(c, rcv)
-				} else {
-					c.AbortWithError(http.StatusInternalServerError, fmt.Errorf("panic recovered: %v", rcv))
-				}
-			}
-		}()
-		c.Next()
-	}
-}
-
-// RequestID middleware
-func RequestID() MiddlewareFunc {
-	return func(c Context) {
-		c.SetHeader("X-Request-ID", c.RequestID())
-		c.Next()
-	}
-}
-
-// CORS middleware
-func CORS(origins []string) MiddlewareFunc {
-	return func(c Context) {
-		origin := string(c.RequestCtx().Request.Header.Peek("Origin"))
-
-		// Check if origin is allowed
-		allowed := false
-		for _, o := range origins {
-			if o == "*" || o == origin {
-				allowed = true
-				break
-			}
-		}
-
-		if allowed {
-			c.SetHeader("Access-Control-Allow-Origin", origin)
-			c.SetHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-			c.SetHeader("Access-Control-Allow-Headers", "Authorization,Content-Type")
-			c.SetHeader("Access-Control-Allow-Credentials", "true")
-
-			// Handle preflight requests
-			if c.Method() == "OPTIONS" {
-				c.AbortWithError(http.StatusNoContent, nil)
-				return
-			}
-		}
-
-		c.Next()
-	}
-}
-
 // Implement all required Context methods
 func (c *contextImpl) Cookie(name string) string {
 	return string(c.RequestCtx().Request.Header.Cookie(name))
