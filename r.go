@@ -46,7 +46,7 @@ type Server interface {
 }
 
 // HandlerFunc defines a function to serve HTTP requests
-type HandlerFunc func(ctx Context)
+type HandlerFunc = MiddlewareFunc
 
 // MiddlewareFunc defines HTTP middleware
 type MiddlewareFunc func(Context)
@@ -76,13 +76,14 @@ func (c *wsConnection) RemoteAddr() string {
 	return c.Conn.RemoteAddr().String()
 }
 
-// routerImpl implements the Router interface using fasthttp-routing
-type routerImpl struct {
+// RouterImpl implements the Router interface using fasthttp-routing
+type RouterImpl struct {
 	router                  *routing.Router
 	group                   *routing.RouteGroup
 	upgrader                websocket.FastHTTPUpgrader
 	panicHandler            PanicHandlerFunc
-	methodNotAllowedHandler HandlerFunc // Add this field
+	methodNotAllowedHandler HandlerFunc
+	middlewareProvider      MiddlewareProvider // Add this
 }
 
 func (c *contextImpl) Request() *http.Request {
@@ -99,6 +100,9 @@ func (c *contextImpl) Request() *http.Request {
 
 func (c *contextImpl) Set(key string, value interface{}) {
 	c.storeMu.Lock()
+	if c.store == nil {
+		c.store = make(map[string]interface{})
+	}
 	c.store[key] = value
 	c.storeMu.Unlock()
 }
@@ -125,13 +129,14 @@ func (c *contextImpl) String(code int, s string) error {
 
 func (c *contextImpl) Next() {
 	c.handlerIdx++
-	if c.handlerIdx < len(c.handlers) {
+	for c.handlerIdx < len(c.handlers) {
 		c.handlers[c.handlerIdx](c)
+		c.handlerIdx++
 	}
 }
 
 // WS implements Router.WS
-func (r *routerImpl) WS(path string, handler WSHandler) Router {
+func (r *RouterImpl) WS(path string, handler WSHandler) Router {
 	r.group.Get(path, func(c *routing.Context) error {
 		err := r.upgrader.Upgrade(c.RequestCtx, func(conn *websocket.Conn) {
 			wsConn := newWSConnection(conn)
@@ -199,19 +204,23 @@ func (c *wsConnection) writePump() {
 }
 
 // Group implements Router.Group
-func (r *routerImpl) Group(prefix string) Router {
-	return &routerImpl{
+func (r *RouterImpl) Group(prefix string) Router {
+	return &RouterImpl{
 		router: r.router,
 		group:  r.group.Group(prefix),
 	}
 }
 
 // Use implements Router.Use
-func (r *routerImpl) Use(middleware ...MiddlewareFunc) Router {
+func (r *RouterImpl) Use(middleware ...MiddlewareFunc) Router {
 	for _, m := range middleware {
 		r.group.Use(func(c *routing.Context) error {
 			ctx := newContextImpl(c)
-			m(ctx)
+			// Since HandlerFunc and MiddlewareFunc are now the same type,
+			// we can directly append the middleware
+			ctx.handlers = append(ctx.handlers, m)
+			ctx.handlerIdx = -1
+			ctx.Next()
 			return nil
 		})
 	}
@@ -302,18 +311,20 @@ type contextImpl struct {
 	requestID  string
 	err        error
 	aborted    bool
-	router     *routerImpl
+	router     *RouterImpl
 }
 
 func newContextImpl(c *routing.Context) *contextImpl {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &contextImpl{
+	impl := &contextImpl{
 		Context:   c,
 		ctx:       ctx,
 		cancel:    cancel,
 		requestID: uuid.New().String(),
-		store:     make(map[string]interface{}), // Initialize map
+		store:     make(map[string]interface{}),
+		handlers:  make([]HandlerFunc, 0), // Initialize handlers slice
 	}
+	return impl
 }
 
 // Implement Context interface methods
@@ -412,6 +423,9 @@ func (c *contextImpl) GetHeader(key string) string {
 }
 
 func (c *contextImpl) RequestID() string {
+	if c.requestID == "" {
+		c.requestID = uuid.New().String()
+	}
 	return c.requestID
 }
 
@@ -437,46 +451,46 @@ func (c *contextImpl) Redirect(code int, url string) error {
 }
 
 // Implement all required Router methods
-func (r *routerImpl) DELETE(path string, handlers ...HandlerFunc) Router {
+func (r *RouterImpl) DELETE(path string, handlers ...HandlerFunc) Router {
 	r.group.Delete(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
-func (r *routerImpl) PUT(path string, handlers ...HandlerFunc) Router {
+func (r *RouterImpl) PUT(path string, handlers ...HandlerFunc) Router {
 	r.group.Put(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
-func (r *routerImpl) PATCH(path string, handlers ...HandlerFunc) Router {
+func (r *RouterImpl) PATCH(path string, handlers ...HandlerFunc) Router {
 	r.group.Patch(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
-func (r *routerImpl) HEAD(path string, handlers ...HandlerFunc) Router {
+func (r *RouterImpl) HEAD(path string, handlers ...HandlerFunc) Router {
 	r.group.Head(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
-func (r *routerImpl) OPTIONS(path string, handlers ...HandlerFunc) Router {
+func (r *RouterImpl) OPTIONS(path string, handlers ...HandlerFunc) Router {
 	r.group.Options(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
-func (r *routerImpl) Static(prefix, root string) Router {
+func (r *RouterImpl) Static(prefix, root string) Router {
 	r.group.Get(prefix+"/*", staticHandler(root))
 	return r
 }
 
-func (r *routerImpl) FileServer(path, root string) Router {
+func (r *RouterImpl) FileServer(path, root string) Router {
 	r.group.Get(path, staticHandler(root))
 	return r
 }
 
-func (r *routerImpl) NotFound(handler HandlerFunc) {
+func (r *RouterImpl) NotFound(handler HandlerFunc) {
 	r.router.NotFound(r.wrapHandlers(handler)[0])
 }
 
-func (r *routerImpl) MethodNotAllowed(handler HandlerFunc) {
+func (r *RouterImpl) MethodNotAllowed(handler HandlerFunc) {
 	// Store the handler to be used in NotFound
 	r.methodNotAllowedHandler = handler
 
@@ -493,22 +507,28 @@ func (r *routerImpl) MethodNotAllowed(handler HandlerFunc) {
 	})
 }
 
-func (r *routerImpl) PanicHandler(handler PanicHandlerFunc) {
+func (r *RouterImpl) PanicHandler(handler PanicHandlerFunc) {
 	r.panicHandler = handler
 }
 
+// Add getter for middleware provider
+func (r *RouterImpl) GetMiddlewareProvider() MiddlewareProvider {
+	return r.middlewareProvider
+}
+
 // Helper method to wrap HandlerFunc into routing.Handler
-func (r *routerImpl) wrapHandlers(handlers ...HandlerFunc) []routing.Handler {
+func (r *RouterImpl) wrapHandlers(handlers ...HandlerFunc) []routing.Handler {
 	wrapped := make([]routing.Handler, len(handlers))
 	for i, h := range handlers {
 		h := h // Create a new variable scope
 		wrapped[i] = func(c *routing.Context) error {
 			ctx := &contextImpl{
-				Context:  c,
-				router:   r,
-				handlers: handlers,
+				Context:    c,
+				router:     r,
+				handlers:   append(make([]HandlerFunc, 0), h),
+				handlerIdx: -1,
 			}
-			h(ctx)
+			ctx.Next()
 			return nil
 		}
 	}
@@ -532,19 +552,19 @@ func staticHandler(root string) routing.Handler {
 }
 
 // Update existing Router methods to use wrapHandlers
-func (r *routerImpl) GET(path string, handlers ...HandlerFunc) Router {
+func (r *RouterImpl) GET(path string, handlers ...HandlerFunc) Router {
 	r.group.Get(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
-func (r *routerImpl) POST(path string, handlers ...HandlerFunc) Router {
+func (r *RouterImpl) POST(path string, handlers ...HandlerFunc) Router {
 	r.group.Post(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
 // NewRouter creates a new Router instance
 func NewRouter() Router {
-	r := &routerImpl{
+	r := &RouterImpl{
 		router: routing.New(),
 		upgrader: websocket.FastHTTPUpgrader{
 			EnableCompression: true,
@@ -554,13 +574,17 @@ func NewRouter() Router {
 		},
 	}
 	r.group = r.router.Group("")
+
+	// Initialize middleware provider
+	r.middlewareProvider = NewMiddlewareProvider(r)
+
 	return r
 }
 
 // Server implementation
 type serverImpl struct {
 	server   *fasthttp.Server
-	router   *routerImpl
+	router   *RouterImpl
 	config   Config
 	shutdown chan struct{}
 	wg       sync.WaitGroup
@@ -573,7 +597,7 @@ func NewServer(config Config) *serverImpl {
 	}
 
 	s := &serverImpl{
-		router:   config.Handler.(*routerImpl), // Use the provided router
+		router:   config.Handler.(*RouterImpl), // Use the provided router
 		config:   config,
 		shutdown: make(chan struct{}),
 	}
@@ -589,6 +613,16 @@ func NewServer(config Config) *serverImpl {
 
 func (s *serverImpl) buildHandler() fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
+		// Create a new routing context
+		c := newRoutingContext(ctx)
+		reqCtx := newContextImpl(c)
+
+		// Ensure request ID is set
+		if reqCtx.RequestID() == "" {
+			reqCtx.requestID = uuid.New().String()
+		}
+
+		// Handle the request
 		s.router.router.HandleRequest(ctx)
 	}
 }
@@ -618,4 +652,10 @@ func (s *serverImpl) Stop() error {
 	defer cancel()
 
 	return s.server.ShutdownWithContext(ctx)
+}
+
+func newRoutingContext(ctx *fasthttp.RequestCtx) *routing.Context {
+	return &routing.Context{
+		RequestCtx: ctx,
+	}
 }

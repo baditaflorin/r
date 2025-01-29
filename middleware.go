@@ -54,11 +54,11 @@ type standardMiddleware struct {
 	logger      Logger
 	security    SecurityProvider
 	corsConfig  *CORSConfig
-	router      *routerImpl // Added for panic handler access
+	router      *RouterImpl // Added for panic handler access
 }
 
 // NewMiddlewareProvider creates a new middleware provider with optional dependencies
-func NewMiddlewareProvider(router *routerImpl, opts ...MiddlewareOption) MiddlewareProvider {
+func NewMiddlewareProvider(router *RouterImpl, opts ...MiddlewareOption) MiddlewareProvider {
 	m := &standardMiddleware{
 		router: router,
 		corsConfig: &CORSConfig{
