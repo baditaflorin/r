@@ -204,5 +204,6 @@ func (cb *CircuitBreaker) startStateMonitor() {
 
 func (cb *CircuitBreaker) Close() error {
 	close(cb.stopMonitor)
+	time.Sleep(50 * time.Millisecond)
 	return nil
 }
