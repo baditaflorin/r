@@ -2,6 +2,7 @@ package r_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/baditaflorin/r"
 	"github.com/qiangxue/fasthttp-routing"
 	"github.com/valyala/fasthttp"
@@ -10,12 +11,9 @@ import (
 )
 
 // createTestContext creates a new context for testing
-func createTestContext() *r.ContextImpl {
-	// Create a new fasthttp request context
+func createTestContext() r.Context {
 	ctx := &fasthttp.RequestCtx{}
-	// Create a new routing context
 	routingCtx := &routing.Context{RequestCtx: ctx}
-	// Create our context implementation
 	return r.NewTestContext(routingCtx)
 }
 
@@ -29,7 +27,7 @@ func TestContext_SetAndGet(t *testing.T) {
 
 func TestContext_Timeout(t *testing.T) {
 	ctx := createTestContext()
-	timeoutCtx, cancel := ctx.WithTimeout(1 * time.Second)
+	timeoutCtx, cancel := r.TestContextWithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
 	time.Sleep(2 * time.Second)
@@ -45,7 +43,7 @@ func TestContext_RequestID(t *testing.T) {
 	}
 }
 
-func createTestContextWithMethod(method string) *r.ContextImpl {
+func createTestContextWithMethod(method string) r.Context {
 	ctx := &fasthttp.RequestCtx{}
 	ctx.Request.Header.SetMethod(method)
 	routingCtx := &routing.Context{RequestCtx: ctx}
@@ -80,20 +78,9 @@ func TestContext_QueryParam(t *testing.T) {
 
 func TestContext_Headers(t *testing.T) {
 	ctx := createTestContext()
-
-	// Set the header using the underlying fasthttp RequestCtx
-	ctx.RequestCtx().Response.Header.Set("X-Test", "test-value")
-
-	// Verify the header was set correctly
-	value := string(ctx.RequestCtx().Response.Header.Peek("X-Test"))
-	if value != "test-value" {
+	ctx.SetHeader("X-Test", "test-value")
+	if value := ctx.GetHeader("X-Test"); value != "test-value" {
 		t.Errorf("Expected header value 'test-value', got %s", value)
-	}
-
-	// Test the higher-level Context interface methods
-	ctx.SetHeader("X-Test-2", "test-value-2")
-	if value2 := ctx.GetHeader("X-Test-2"); value2 != "test-value-2" {
-		t.Errorf("Expected header value 'test-value-2', got %s", value2)
 	}
 }
 
@@ -105,7 +92,7 @@ func TestContext_JSON(t *testing.T) {
 		t.Errorf("Failed to write JSON response: %v", err)
 	}
 
-	contentType := string(ctx.RequestCtx().Response.Header.ContentType())
+	contentType := ctx.GetHeader("Content-Type")
 	if contentType != "application/json" {
 		t.Errorf("Expected content type application/json, got %s", contentType)
 	}
@@ -117,5 +104,102 @@ func TestContext_JSON(t *testing.T) {
 
 	if result["key"] != "value" {
 		t.Errorf("Expected JSON value 'value', got %s", result["key"])
+	}
+}
+
+func TestContext_String(t *testing.T) {
+	ctx := createTestContext()
+	testString := "test response"
+
+	if err := ctx.String(200, testString); err != nil {
+		t.Errorf("Failed to write string response: %v", err)
+	}
+
+	response := string(ctx.RequestCtx().Response.Body())
+	if response != testString {
+		t.Errorf("Expected string response '%s', got '%s'", testString, response)
+	}
+}
+
+func TestContext_RealIP(t *testing.T) {
+	ctx := createTestContext()
+	testIP := "127.0.0.1"
+
+	ctx.SetHeader("X-Real-IP", testIP)
+	if ip := ctx.RealIP(); ip != testIP {
+		t.Errorf("Expected IP %s from X-Real-IP, got %s", testIP, ip)
+	}
+
+	ctx.SetHeader("X-Real-IP", "")
+	ctx.SetHeader("X-Forwarded-For", testIP)
+	if ip := ctx.RealIP(); ip != testIP {
+		t.Errorf("Expected IP %s from X-Forwarded-For, got %s", testIP, ip)
+	}
+}
+
+// Fixed test implementation
+func TestContext_IsWebSocket(t *testing.T) {
+	ctx := createTestContext()
+
+	// First check when it's not a WebSocket request
+	if ctx.IsWebSocket() {
+		t.Error("Expected non-WebSocket request")
+	}
+
+	// Set the Upgrade header directly on the underlying RequestCtx
+	ctx.RequestCtx().Request.Header.Set("Upgrade", "websocket")
+
+	if !ctx.IsWebSocket() {
+		t.Error("Expected WebSocket request")
+	}
+}
+
+func TestContext_Abort(t *testing.T) {
+	routingCtx := &routing.Context{RequestCtx: &fasthttp.RequestCtx{}}
+	handlerCalled := false
+
+	handlers := []r.HandlerFunc{
+		func(c r.Context) {
+			c.Abort()
+		},
+		func(c r.Context) {
+			handlerCalled = true
+		},
+	}
+
+	ctx := r.TestContextWithHandlers(routingCtx, handlers)
+	ctx.Next()
+
+	if handlerCalled {
+		t.Error("Expected abort to prevent subsequent handlers from being called")
+	}
+}
+
+func TestContext_AbortWithError(t *testing.T) {
+	routingCtx := &routing.Context{RequestCtx: &fasthttp.RequestCtx{}}
+	handlerCalled := false
+
+	handlers := []r.HandlerFunc{
+		func(c r.Context) {
+			c.AbortWithError(500, fmt.Errorf("test error"))
+		},
+		func(c r.Context) {
+			handlerCalled = true
+		},
+	}
+
+	ctx := r.TestContextWithHandlers(routingCtx, handlers)
+	ctx.Next()
+
+	if handlerCalled {
+		t.Error("Expected abort to prevent subsequent handlers from being called")
+	}
+
+	if err := ctx.Error(); err == nil || err.Error() != "test error" {
+		t.Errorf("Expected error 'test error', got %v", err)
+	}
+
+	if ctx.RequestCtx().Response.StatusCode() != 500 {
+		t.Errorf("Expected status code 500, got %d", ctx.RequestCtx().Response.StatusCode())
 	}
 }

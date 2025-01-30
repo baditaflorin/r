@@ -122,7 +122,7 @@ func (c *ContextImpl) String(code int, s string) error {
 
 func (c *ContextImpl) Next() {
 	c.handlerIdx++
-	for c.handlerIdx < len(c.handlers) {
+	for c.handlerIdx < len(c.handlers) && !c.aborted {
 		c.handlers[c.handlerIdx](c)
 		c.handlerIdx++
 	}

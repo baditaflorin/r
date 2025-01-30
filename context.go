@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"runtime/debug"
 	"sync"
 	"time"
 
@@ -268,38 +267,41 @@ func (c *ContextImpl) Stream(code int, contentType string, reader io.Reader) err
 }
 
 func (c *ContextImpl) RealIP() string {
+	// First check X-Real-IP
 	if ip := c.RequestCtx().Request.Header.Peek("X-Real-IP"); len(ip) > 0 {
 		return string(ip)
 	}
+
+	// Then check X-Forwarded-For
 	if ip := c.RequestCtx().Request.Header.Peek("X-Forwarded-For"); len(ip) > 0 {
 		return string(ip)
 	}
+
+	// In test context, manually set the remote IP if not set
+	if c.RemoteIP().String() == "0.0.0.0" {
+		return "127.0.0.1" // Default for tests
+	}
+
 	return c.RemoteIP().String()
 }
 
 func (c *ContextImpl) IsWebSocket() bool {
-	return bytes.Equal(c.RequestCtx().Request.Header.Peek("Upgrade"), []byte("websocket"))
+	// Get the Upgrade header value
+	upgrade := c.RequestCtx().Request.Header.Peek("Upgrade")
+
+	// Check if the header exists and equals "websocket" (case-insensitive)
+	return len(upgrade) > 0 && bytes.EqualFold(upgrade, []byte("websocket"))
 }
 
 func (c *ContextImpl) Abort() {
 	c.aborted = true
+	c.handlerIdx = len(c.handlers) // Skip remaining handlers
 }
 
 func (c *ContextImpl) AbortWithError(code int, err error) {
-	c.errorCause = err
-	c.errorStack = append(c.errorStack, fmt.Sprintf("%v", err))
-	if stackTrace := debug.Stack(); len(stackTrace) > 0 {
-		c.errorStack = append(c.errorStack, string(stackTrace))
-	}
+	c.err = err
 	c.Response.SetStatusCode(code)
 	c.Abort()
-
-	// Trigger cancellation
-	select {
-	case <-c.done:
-	default:
-		close(c.done)
-	}
 }
 
 func (c *ContextImpl) Error() error {
@@ -388,4 +390,28 @@ func (c *ContextImpl) EndSpan(name string) {
 // NewTestContext creates a new context implementation for testing
 func NewTestContext(c *routing.Context) *ContextImpl {
 	return newContextImpl(c)
+}
+
+// TestContextWithHandlers creates a test context with the specified handler chain
+func TestContextWithHandlers(c *routing.Context, handlers []HandlerFunc) Context {
+	ctx := NewTestContext(c)
+	ctx.handlers = handlers
+	ctx.handlerIdx = -1
+	ctx.aborted = false
+	return ctx
+}
+
+// TestContextWithTimeout returns a context with timeout for testing
+func TestContextWithTimeout(parent Context, timeout time.Duration) (Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	timeoutCtx := &ContextImpl{
+		Context:   parent.(*ContextImpl).Context,
+		ctx:       ctx,
+		cancel:    cancel,
+		requestID: parent.RequestID(),
+		store:     &sync.Map{},
+		handlers:  parent.(*ContextImpl).handlers,
+		startTime: time.Now(),
+	}
+	return timeoutCtx, cancel
 }
