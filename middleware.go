@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/google/uuid"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -94,20 +95,38 @@ type defaultRateLimiter struct {
 	cleanupTick *time.Ticker
 	redisClient RedisClient
 	keyPrefix   string
+	logger      Logger
+	metrics     MetricsCollector
 }
 
-func NewDefaultRateLimiter(reqs int, per time.Duration) RateLimiter {
+// Update constructor to include new fields
+func NewDefaultRateLimiter(reqs int, per time.Duration, opts ...RateLimiterOption) RateLimiter {
 	rl := &defaultRateLimiter{
 		tokens:      make(map[string]float64),
 		lastReq:     make(map[string]time.Time),
 		maxRate:     float64(reqs),
 		per:         per,
 		cleanupTick: time.NewTicker(time.Minute * 5),
+		keyPrefix:   "ratelimit",
+		logger:      NewDefaultLogger(),
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(rl)
 	}
 
 	// Start cleanup goroutine
 	go rl.cleanup()
 	return rl
+}
+
+type RateLimiterOption func(*defaultRateLimiter)
+
+func WithMetrics(metrics MetricsCollector) RateLimiterOption {
+	return func(rl *defaultRateLimiter) {
+		rl.metrics = metrics
+	}
 }
 
 func (rl *defaultRateLimiter) cleanup() {
@@ -159,43 +178,91 @@ func (rl *defaultRateLimiter) localAllow(key string) bool {
 func (rl *defaultRateLimiter) distributedAllow(key string) bool {
 	redisKey := fmt.Sprintf("%s:%s", rl.keyPrefix, key)
 
-	// Try to get current token count
-	count, err := rl.redisClient.IncrBy(redisKey, -1)
-	if err != nil {
-		// Fallback to local rate limiting on Redis errors
+	// Use simpler implementation with existing RedisClient interface
+	now := time.Now().UnixNano()
+	windowStart := now - rl.per.Nanoseconds()
+
+	// Remove old entries
+	if err := rl.redisClient.ZRemRangeByScore(redisKey,
+		"0",
+		strconv.FormatInt(windowStart, 10)); err != nil {
+		rl.logger.Error("Failed to remove old entries",
+			"error", err,
+			"key", key)
 		return rl.localAllow(key)
 	}
 
-	// Initialize if not exists
-	if count < 0 {
-		rl.redisClient.Set(redisKey,
-			fmt.Sprintf("%d", int(rl.maxRate)),
-			rl.per)
-		return true
+	// Add new request
+	if err := rl.redisClient.ZAdd(redisKey,
+		float64(now),
+		strconv.FormatInt(now, 10)); err != nil {
+		rl.logger.Error("Failed to add new request",
+			"error", err,
+			"key", key)
+		return rl.localAllow(key)
 	}
 
-	return count >= 0
+	// Get current count
+	count, err := rl.redisClient.ZCount(redisKey,
+		strconv.FormatInt(windowStart, 10),
+		"+inf")
+	if err != nil {
+		rl.logger.Error("Failed to get request count",
+			"error", err,
+			"key", key)
+		return rl.localAllow(key)
+	}
+
+	// Set expiration using existing Set method
+	rl.redisClient.Set(redisKey+":exp", "", rl.per*2)
+
+	// Update metrics if available
+	if rl.metrics != nil {
+		rl.metrics.RecordValue("rate_limiter.requests", float64(count),
+			map[string]string{"key": key})
+	}
+
+	allowed := count <= int64(rl.maxRate)
+	if !allowed && rl.metrics != nil {
+		rl.metrics.IncrementCounter("rate_limiter.exceeded",
+			map[string]string{"key": key})
+	}
+
+	return allowed
 }
 
-// Implement GetQuota method
 func (rl *defaultRateLimiter) GetQuota(key string) (remaining int, reset time.Time) {
 	if rl.redisClient != nil {
-		// Get distributed quota
 		redisKey := fmt.Sprintf("%s:%s", rl.keyPrefix, key)
-		countStr, err := rl.redisClient.Get(redisKey)
+
+		now := time.Now()
+		windowStart := now.Add(-rl.per).UnixNano()
+
+		count, err := rl.redisClient.ZCount(redisKey,
+			strconv.FormatInt(windowStart, 10),
+			"+inf")
+
 		if err == nil {
-			count, _ := strconv.Atoi(countStr)
-			return count, time.Now().Add(rl.per)
+			// Properly convert between float64 and int
+			remaining = int(math.Max(0, rl.maxRate-float64(count)))
+			return remaining, now.Add(rl.per)
 		}
+
+		rl.logger.Error("Failed to get quota from Redis",
+			"error", err,
+			"key", key)
 	}
 
-	// Get local quota
+	// Fallback to local quota
 	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+
 	tokens := rl.tokens[key]
 	lastReq := rl.lastReq[key]
-	rl.mu.RUnlock()
 
-	return int(tokens), lastReq.Add(rl.per)
+	remaining = int(math.Max(0, tokens))
+
+	return remaining, lastReq.Add(rl.per)
 }
 
 func (rl *defaultRateLimiter) Reset(key string) {
@@ -418,6 +485,10 @@ type RedisClient interface {
 	Get(key string) (string, error)
 	Set(key string, value string, expiration time.Duration) error
 	IncrBy(key string, value int64) (int64, error)
+	// Add new methods for rate limiting
+	ZRemRangeByScore(key string, min, max string) error
+	ZAdd(key string, score float64, member string) error
+	ZCount(key string, min, max string) (int64, error)
 }
 
 func (rl *defaultRateLimiter) SetDistributedClient(client RedisClient) {
