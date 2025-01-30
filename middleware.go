@@ -53,7 +53,8 @@ type standardMiddleware struct {
 	logger      Logger
 	security    SecurityProvider
 	corsConfig  *CORSConfig
-	router      *RouterImpl // Added for panic handler access
+	router      *RouterImpl
+	metrics     MetricsCollector // Add this field
 }
 
 // NewMiddlewareProvider creates a new middleware provider with optional dependencies
@@ -498,28 +499,128 @@ func (rl *defaultRateLimiter) SetDistributedClient(client RedisClient) {
 	rl.keyPrefix = "ratelimit" // Default prefix, could be made configurable
 }
 
-func (m *standardMiddleware) CircuitBreaker(threshold int64, resetTimeout time.Duration) MiddlewareFunc {
-	cb := &CircuitBreaker{
-		threshold:    threshold,
-		resetTimeout: resetTimeout,
+func (m *standardMiddleware) CircuitBreaker(opts ...CircuitBreakerOption) MiddlewareFunc {
+	config := defaultCircuitBreakerConfig()
+	for _, opt := range opts {
+		opt(&config)
 	}
 
+	breakers := &sync.Map{}
+
 	return func(c Context) {
-		if cb.isOpen() {
+		path := c.Path()
+		method := c.Method()
+		key := method + ":" + path
+
+		// Get or create circuit breaker for this endpoint
+		cbValue, _ := breakers.LoadOrStore(key, NewCircuitBreaker(
+			config.Threshold,
+			config.ResetTimeout,
+			m.metrics,
+		))
+		circuitBreaker := cbValue.(*CircuitBreaker)
+
+		// Check if circuit is open
+		if circuitBreaker.isOpen() {
+			if m.metrics != nil {
+				m.metrics.IncrementCounter("circuit_breaker.rejected",
+					map[string]string{
+						"path":   path,
+						"method": method,
+					})
+			}
+
 			c.AbortWithError(http.StatusServiceUnavailable,
-				fmt.Errorf("circuit breaker open"))
+				fmt.Errorf("circuit breaker open for %s %s", method, path))
 			return
 		}
 
+		// Start timing the request
 		start := time.Now()
-		c.Next()
 
-		if c.Error() != nil {
-			cb.recordFailure()
-		}
+		// Create context with timeout
+		ctx, cancel := context.WithTimeout(c, config.Timeout)
+		defer cancel()
 
-		if time.Since(start) > 5*time.Second {
-			cb.recordFailure() // Consider slow responses as failures
+		// Replace original context
+		c.(*contextImpl).ctx = ctx
+
+		// Execute handler with panic recovery
+		var handlerError error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					handlerError = fmt.Errorf("panic: %v", r)
+					if m.metrics != nil {
+						m.metrics.IncrementCounter("circuit_breaker.panics",
+							map[string]string{
+								"path":   path,
+								"method": method,
+							})
+					}
+				}
+			}()
+			c.Next()
+			if err := c.Error(); err != nil {
+				handlerError = err
+			}
+		}()
+
+		// Record metrics and update circuit breaker state
+		duration := time.Since(start)
+
+		if handlerError != nil || duration > config.Timeout {
+			circuitBreaker.recordFailure()
+
+			if m.metrics != nil {
+				m.metrics.IncrementCounter("circuit_breaker.failures",
+					map[string]string{
+						"path":   path,
+						"method": method,
+						"reason": handlerError.Error(),
+					})
+			}
+		} else {
+			circuitBreaker.recordSuccess()
+
+			if m.metrics != nil {
+				m.metrics.RecordTiming("circuit_breaker.success_latency",
+					duration,
+					map[string]string{
+						"path":   path,
+						"method": method,
+					})
+			}
 		}
+	}
+}
+
+type CircuitBreakerConfig struct {
+	Threshold        int64
+	ResetTimeout     time.Duration
+	Timeout          time.Duration
+	HalfOpenRequests int64
+}
+
+type CircuitBreakerOption func(*CircuitBreakerConfig)
+
+func defaultCircuitBreakerConfig() CircuitBreakerConfig {
+	return CircuitBreakerConfig{
+		Threshold:        5,
+		ResetTimeout:     10 * time.Second,
+		Timeout:          5 * time.Second,
+		HalfOpenRequests: 2,
+	}
+}
+
+func WithFailureThreshold(threshold int64) CircuitBreakerOption {
+	return func(c *CircuitBreakerConfig) {
+		c.Threshold = threshold
+	}
+}
+
+func WithResetTimeout(timeout time.Duration) CircuitBreakerOption {
+	return func(c *CircuitBreakerConfig) {
+		c.ResetTimeout = timeout
 	}
 }

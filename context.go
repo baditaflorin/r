@@ -136,7 +136,13 @@ func (c *contextImpl) cleanup() {
 		// Record root span metrics
 		if c.metrics != nil {
 			c.metrics.RecordTiming("request.total_time",
-				c.rootSpan.endTime.Sub(c.rootSpan.startTime))
+				c.rootSpan.endTime.Sub(c.rootSpan.startTime),
+				map[string]string{
+					"path":       c.Path(),
+					"method":     c.Method(),
+					"request_id": c.requestID,
+					"span":       "root",
+				})
 		}
 	}
 
@@ -150,13 +156,19 @@ func (c *contextImpl) cleanup() {
 	// Record final metrics
 	if c.metrics != nil {
 		c.metrics.RecordTiming("request.total_time",
-			time.Since(c.startTime))
+			time.Since(c.startTime),
+			map[string]string{
+				"path":       c.Path(),
+				"method":     c.Method(),
+				"request_id": c.requestID,
+			})
 
 		if err := c.Error(); err != nil {
 			c.metrics.IncrementCounter("request.errors",
 				map[string]string{
 					"path":   c.Path(),
 					"method": c.Method(),
+					"error":  err.Error(),
 				})
 		}
 	}
@@ -353,7 +365,13 @@ func (c *contextImpl) EndSpan(name string) {
 			// Record span metrics
 			if c.metrics != nil {
 				c.metrics.RecordTiming("request.span.duration",
-					span.endTime.Sub(span.startTime))
+					span.endTime.Sub(span.startTime),
+					map[string]string{
+						"span_name":  name,
+						"path":       c.Path(),
+						"method":     c.Method(),
+						"request_id": c.requestID,
+					})
 			}
 			break
 		}

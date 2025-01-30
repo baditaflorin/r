@@ -1,7 +1,8 @@
 package r
 
 import (
-	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,7 +13,7 @@ import (
 // Add at the top with other type definitions
 type MetricsCollector interface {
 	IncrementCounter(name string, tags map[string]string)
-	RecordTiming(name string, duration time.Duration)
+	RecordTiming(name string, duration time.Duration, tags map[string]string)
 	RecordValue(name string, value float64, tags map[string]string)
 	GetMetrics() map[string]interface{}
 	Close() error
@@ -30,19 +31,10 @@ func NewDefaultMetricsCollector() MetricsCollector {
 }
 
 func (m *defaultMetricsCollector) IncrementCounter(name string, tags map[string]string) {
-	key := name
-	for k, v := range tags {
-		key += fmt.Sprintf(":%s=%s", k, v)
-	}
+	key := m.formatKey(name, tags)
 	value := atomic.Int64{}
 	actual, _ := m.counters.LoadOrStore(key, &value)
 	actual.(*atomic.Int64).Add(1)
-}
-
-func (m *defaultMetricsCollector) RecordTiming(name string, duration time.Duration) {
-	value := atomic.Int64{}
-	actual, _ := m.timings.LoadOrStore(name, &value)
-	actual.(*atomic.Int64).Store(duration.Nanoseconds())
 }
 
 func (m *defaultMetricsCollector) GetMetrics() map[string]interface{} {
@@ -56,13 +48,13 @@ func (m *defaultMetricsCollector) GetMetrics() map[string]interface{} {
 
 	// Collect timings
 	m.timings.Range(func(key, value interface{}) bool {
-		metrics["timing_"+key.(string)] = value.(*atomic.Int64).Load()
+		metrics[key.(string)] = value.(*atomic.Int64).Load()
 		return true
 	})
 
 	// Collect values
 	m.values.Range(func(key, value interface{}) bool {
-		metrics["value_"+key.(string)] = value.(*atomic.Value).Load()
+		metrics[key.(string)] = value.(*atomic.Value).Load()
 		return true
 	})
 
@@ -70,22 +62,45 @@ func (m *defaultMetricsCollector) GetMetrics() map[string]interface{} {
 }
 
 func (m *defaultMetricsCollector) Close() error {
-	// Perform any cleanup needed
 	return nil
 }
 
 func (m *defaultMetricsCollector) RecordValue(name string, value float64, tags map[string]string) {
-	key := name
-	for k, v := range tags {
-		key += fmt.Sprintf(":%s=%s", k, v)
-	}
-
-	// Store the value using atomic operations
+	key := m.formatKey(name, tags)
 	valueWrapper := &atomic.Value{}
 	valueWrapper.Store(value)
-
 	actual, loaded := m.values.LoadOrStore(key, valueWrapper)
 	if loaded {
 		actual.(*atomic.Value).Store(value)
 	}
+}
+
+func (m *defaultMetricsCollector) formatKey(name string, tags map[string]string) string {
+	if len(tags) == 0 {
+		return name
+	}
+
+	// Sort tags for consistent key generation
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var sb strings.Builder
+	sb.WriteString(name)
+	for _, k := range keys {
+		sb.WriteString(":")
+		sb.WriteString(k)
+		sb.WriteString("=")
+		sb.WriteString(tags[k])
+	}
+	return sb.String()
+}
+
+func (m *defaultMetricsCollector) RecordTiming(name string, duration time.Duration, tags map[string]string) {
+	key := m.formatKey(name, tags)
+	value := atomic.Int64{}
+	actual, _ := m.timings.LoadOrStore(key, &value)
+	actual.(*atomic.Int64).Store(duration.Nanoseconds())
 }

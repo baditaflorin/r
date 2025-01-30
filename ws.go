@@ -201,11 +201,16 @@ func (c *wsConnection) Close() error {
 
 		// Record metrics
 		if c.metrics != nil {
-			c.metrics.IncrementCounter("ws.connections.closed", map[string]string{
-				"id": c.id,
-			})
+			c.metrics.IncrementCounter("ws.connections.closed",
+				map[string]string{
+					"conn_id": c.id,
+				})
 			c.metrics.RecordTiming("ws.connection.duration",
-				time.Since(time.Unix(0, c.lastPing.Load())))
+				time.Since(time.Unix(0, c.lastPing.Load())),
+				map[string]string{
+					"conn_id":     c.id,
+					"remote_addr": c.RemoteAddr(),
+				})
 		}
 	})
 	return err
