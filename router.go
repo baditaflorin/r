@@ -162,19 +162,25 @@ func (r *RouterImpl) PanicHandler(handler PanicHandlerFunc) {
 
 func (r *RouterImpl) wrapHandlers(handlers ...HandlerFunc) []routing.Handler {
 	wrapped := make([]routing.Handler, len(handlers))
+
 	for i, h := range handlers {
-		h := h
+		// Capture h in a local variable to avoid closure pitfalls
+		handler := h
+
 		wrapped[i] = func(c *routing.Context) error {
-			start := time.Now()
-			ctx := &contextImpl{
-				Context:    c,
-				router:     r,
-				handlers:   append(make([]HandlerFunc, 0), h),
-				handlerIdx: -1,
-			}
+			// Get contextImpl from sync.Pool
+			ctx := contextPool.Get().(*contextImpl)
+			ctx.Context = c
+			ctx.router = r
+			ctx.handlers = []HandlerFunc{handler}
+			ctx.handlerIdx = -1
 
 			var err error
+			start := time.Now()
 			defer func() {
+				// Return contextImpl to the pool
+				contextPool.Put(ctx)
+				// Metrics update (already present in your code)
 				duration := time.Since(start)
 				r.updateRouteMetrics(
 					string(c.Method()),
@@ -184,7 +190,10 @@ func (r *RouterImpl) wrapHandlers(handlers ...HandlerFunc) []routing.Handler {
 				)
 			}()
 
+			// Process the handlers
 			ctx.Next()
+
+			// Check for any error in the context
 			err = ctx.Error()
 			return err
 		}

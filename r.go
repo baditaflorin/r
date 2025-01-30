@@ -2,6 +2,7 @@
 package r
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -9,12 +10,18 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/fasthttp/websocket"
 	"github.com/qiangxue/fasthttp-routing"
 	"github.com/valyala/fasthttp"
 )
+
+// Add a pool for JSON encoding buffers at the top of log.go
+var jsonBufferPool = sync.Pool{
+	New: func() interface{} { return new(bytes.Buffer) },
+}
 
 type ConfigProvider interface {
 	GetConfig() Config
@@ -91,7 +98,20 @@ func (c *contextImpl) RequestCtx() *fasthttp.RequestCtx {
 func (c *contextImpl) JSON(code int, v interface{}) error {
 	c.Context.RequestCtx.Response.Header.SetContentType("application/json")
 	c.Context.RequestCtx.Response.SetStatusCode(code)
-	return json.NewEncoder(c.Context.RequestCtx.Response.BodyWriter()).Encode(v)
+
+	// Get a buffer from the pool
+	buf := jsonBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer jsonBufferPool.Put(buf) // Return buffer to the pool
+
+	// Encode the JSON directly into the buffer
+	if err := json.NewEncoder(buf).Encode(v); err != nil {
+		return err
+	}
+
+	// Write the bytes to the response
+	c.Context.RequestCtx.Response.SetBody(buf.Bytes())
+	return nil
 }
 
 func (c *contextImpl) String(code int, s string) error {

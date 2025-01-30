@@ -18,11 +18,6 @@ var (
 	}
 )
 
-// Add a pool for JSON encoding buffers at the top of log.go
-var jsonBufferPool = sync.Pool{
-	New: func() interface{} { return new(bytes.Buffer) },
-}
-
 var (
 	mapPool = sync.Pool{
 		New: func() interface{} {
