@@ -49,20 +49,24 @@ type contextImpl struct {
 	cancel     context.CancelFunc
 	handlers   []HandlerFunc
 	handlerIdx int
-	store      *sync.Map // Changed to pointer since sync.Map is meant to be used as a pointer
+	store      *sync.Map
 	requestID  string
 	err        error
 	aborted    bool
 	router     *RouterImpl
 
-	// Add tracing and timing
+	// Tracing and timing
 	startTime  time.Time
 	spans      []*tracingSpan
 	timeouts   map[string]time.Duration
 	metrics    MetricsCollector
-	errorCause error         // Add field to track root cause
-	errorStack []string      // Add error stack trace
-	done       chan struct{} // Add for cancellation support
+	errorCause error
+	errorStack []string
+	done       chan struct{}
+
+	// Add new tracing fields
+	rootSpan *tracingSpan
+	traceID  string
 }
 
 type tracingSpan struct {
@@ -70,6 +74,7 @@ type tracingSpan struct {
 	startTime time.Time
 	endTime   time.Time
 	metadata  map[string]string
+	children  []*tracingSpan
 }
 
 func (c *contextImpl) AddSpan(name string, metadata map[string]string) {
@@ -81,33 +86,142 @@ func (c *contextImpl) AddSpan(name string, metadata map[string]string) {
 	c.spans = append(c.spans, span)
 }
 
-func (c *contextImpl) EndSpan(name string) {
-	for _, span := range c.spans {
-		if span.name == name && span.endTime.IsZero() {
-			span.endTime = time.Now()
-			if c.metrics != nil {
-				c.metrics.RecordTiming("request.span."+name,
-					span.endTime.Sub(span.startTime))
-			}
-			break
+func newContextImpl(c *routing.Context) *contextImpl {
+	// Create cancellable context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+	impl := &contextImpl{
+		Context:    c,
+		ctx:        ctx,
+		cancel:     cancel,
+		requestID:  uuid.New().String(),
+		store:      &sync.Map{},
+		handlers:   make([]HandlerFunc, 0),
+		startTime:  time.Now(),
+		spans:      make([]*tracingSpan, 0),
+		timeouts:   make(map[string]time.Duration),
+		done:       make(chan struct{}),
+		errorStack: make([]string, 0),
+		traceID:    uuid.New().String(), // Generate unique trace ID
+	}
+
+	// Start root span
+	impl.rootSpan = impl.startSpan("request", map[string]string{
+		"request_id": impl.requestID,
+		"method":     impl.Method(),
+		"path":       impl.Path(),
+		"remote_ip":  impl.RealIP(),
+		"trace_id":   impl.traceID,
+	})
+
+	// Setup cleanup on context done
+	go func() {
+		<-ctx.Done()
+		impl.cleanup()
+	}()
+
+	return impl
+}
+
+func (c *contextImpl) cleanup() {
+	// Ensure cancel is called
+	if c.cancel != nil {
+		c.cancel()
+	}
+
+	// End all spans
+	if c.rootSpan != nil {
+		c.rootSpan.endTime = time.Now()
+
+		// Record root span metrics
+		if c.metrics != nil {
+			c.metrics.RecordTiming("request.total_time",
+				c.rootSpan.endTime.Sub(c.rootSpan.startTime))
 		}
+	}
+
+	// End any remaining open spans
+	for _, span := range c.spans {
+		if span.endTime.IsZero() {
+			span.endTime = time.Now()
+		}
+	}
+
+	// Record final metrics
+	if c.metrics != nil {
+		c.metrics.RecordTiming("request.total_time",
+			time.Since(c.startTime))
+
+		if err := c.Error(); err != nil {
+			c.metrics.IncrementCounter("request.errors",
+				map[string]string{
+					"path":   c.Path(),
+					"method": c.Method(),
+				})
+		}
+	}
+
+	// Close done channel
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
 	}
 }
 
-func newContextImpl(c *routing.Context) *contextImpl {
-	ctx, cancel := context.WithCancel(context.Background())
-	impl := &contextImpl{
-		Context:   c,
-		ctx:       ctx,
-		cancel:    cancel,
-		requestID: uuid.New().String(),
-		store:     &sync.Map{}, // Initialize as pointer
-		handlers:  make([]HandlerFunc, 0),
+func (c *contextImpl) startSpan(name string, attributes map[string]string) *tracingSpan {
+	span := &tracingSpan{
+		name:      name,
 		startTime: time.Now(),
-		spans:     make([]*tracingSpan, 0),
-		timeouts:  make(map[string]time.Duration),
+		metadata:  attributes,
+		children:  make([]*tracingSpan, 0),
 	}
-	return impl
+
+	// Add standard attributes
+	if span.metadata == nil {
+		span.metadata = make(map[string]string)
+	}
+	span.metadata["request_id"] = c.requestID
+	span.metadata["trace_id"] = c.traceID
+
+	c.spans = append(c.spans, span)
+
+	// Record span start metric
+	if c.metrics != nil {
+		c.metrics.IncrementCounter("request.span.start",
+			map[string]string{
+				"name": name,
+			})
+	}
+
+	return span
+}
+
+func (c *contextImpl) WithTimeout(timeout time.Duration) (Context, context.CancelFunc) {
+	// Create new timeout context
+	timeoutCtx, cancel := context.WithTimeout(c.ctx, timeout)
+
+	// Create new context impl with timeout
+	newCtx := &contextImpl{
+		Context:   c.Context,
+		ctx:       timeoutCtx,
+		cancel:    cancel,
+		requestID: c.requestID,
+		store:     c.store,
+		handlers:  c.handlers,
+		startTime: c.startTime,
+		spans:     c.spans,
+		timeouts:  c.timeouts,
+		metrics:   c.metrics,
+		rootSpan:  c.rootSpan,
+		traceID:   c.traceID,
+		done:      make(chan struct{}),
+	}
+
+	// Track timeout
+	newCtx.timeouts[fmt.Sprintf("timeout_%d", len(c.timeouts))] = timeout
+
+	return newCtx, cancel
 }
 
 // Implement Context interface methods
@@ -221,4 +335,27 @@ func (c *contextImpl) Redirect(code int, url string) error {
 	c.Response.Header.Set("Location", url)
 	c.Response.SetStatusCode(code)
 	return nil
+}
+
+func (c *contextImpl) GetTraceID() string {
+	return c.traceID
+}
+
+func (c *contextImpl) GetSpans() []*tracingSpan {
+	return c.spans
+}
+
+func (c *contextImpl) EndSpan(name string) {
+	for _, span := range c.spans {
+		if span.name == name && span.endTime.IsZero() {
+			span.endTime = time.Now()
+
+			// Record span metrics
+			if c.metrics != nil {
+				c.metrics.RecordTiming("request.span.duration",
+					span.endTime.Sub(span.startTime))
+			}
+			break
+		}
+	}
 }
