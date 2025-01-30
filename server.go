@@ -3,6 +3,7 @@ package r
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"sync"
@@ -28,6 +29,16 @@ type serverImpl struct {
 	shutdown chan struct{}
 	wg       sync.WaitGroup
 	mu       sync.Mutex
+
+	healthChecks    []HealthCheck
+	activeConns     sync.Map
+	shutdownTimeout time.Duration
+}
+
+type HealthCheck struct {
+	Name     string
+	Check    func() error
+	Interval time.Duration
 }
 
 func NewServer(config Config) *serverImpl {
@@ -117,30 +128,33 @@ func (s *serverImpl) Start(address string) error {
 }
 
 func (s *serverImpl) Stop() error {
-	s.mu.Lock()
-	if s.shutdown == nil {
-		s.mu.Unlock()
-		return fmt.Errorf("server already stopped")
-	}
-	close(s.shutdown)
-	s.shutdown = nil
-	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+	defer cancel()
 
-	// Signal all active connections to complete
+	// Signal shutdown
+	close(s.shutdown)
+
+	// Stop accepting new connections
+	if err := s.server.Shutdown(); err != nil {
+		return fmt.Errorf("shutdown error: %w", err)
+	}
+
+	// Wait for active connections to complete
 	done := make(chan struct{})
 	go func() {
+		s.activeConns.Range(func(key, value interface{}) bool {
+			conn := value.(net.Conn)
+			conn.Close()
+			return true
+		})
 		s.wg.Wait()
 		close(done)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Wait for either graceful shutdown or timeout
 	select {
-	case <-done:
-		return s.server.ShutdownWithContext(ctx)
 	case <-ctx.Done():
-		return fmt.Errorf("shutdown timed out: %v", ctx.Err())
+		return ctx.Err()
+	case <-done:
+		return nil
 	}
 }
