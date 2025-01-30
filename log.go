@@ -18,6 +18,19 @@ var (
 	}
 )
 
+// Add a pool for JSON encoding buffers at the top of log.go
+var jsonBufferPool = sync.Pool{
+	New: func() interface{} { return new(bytes.Buffer) },
+}
+
+var (
+	mapPool = sync.Pool{
+		New: func() interface{} {
+			return make(map[string]interface{}, 10) // Preallocate with a reasonable size
+		},
+	}
+)
+
 type LogEntry struct {
 	Level      LogLevel       `json:"level"`
 	Message    string         `json:"message"`
@@ -97,7 +110,7 @@ func (l *structuredLogger) Info(msg string, args ...interface{}) {
 		Level:   InfoLevel,
 		Message: msg, // Keep raw message
 		Time:    time.Now(),
-		Fields:  l.getFields(),
+		Fields:  l.cloneFields(),
 	}
 
 	// Efficiently append structured log arguments
@@ -110,6 +123,10 @@ func (l *structuredLogger) Info(msg string, args ...interface{}) {
 	}
 
 	l.writeEntry(entry)
+
+	// Return the map to the pool after usage
+	mapPool.Put(entry.Fields)
+	entry.Fields = nil
 }
 
 func (l *structuredLogger) Error(msg string, args ...interface{}) {
@@ -202,10 +219,19 @@ func (l *structuredLogger) cloneFields() map[string]interface{} {
 	l.fieldsMu.RLock()
 	defer l.fieldsMu.RUnlock()
 
-	newFields := make(map[string]interface{}, len(l.fields))
+	// Obtain a map from the pool
+	newFields := mapPool.Get().(map[string]interface{})
+
+	// Clear the map before reuse
+	for k := range newFields {
+		delete(newFields, k)
+	}
+
+	// Clone existing fields into the new map
 	for k, v := range l.fields {
 		newFields[k] = v
 	}
+
 	return newFields
 }
 
@@ -225,17 +251,20 @@ func (l *structuredLogger) writeEntry(entry *LogEntry) {
 	buf.Reset()
 	defer bytesPool.Put(buf)
 
-	// Create a new JSON encoder with the pooled buffer
-	encoder := json.NewEncoder(buf)
+	// Use a pre-allocated JSON encoder buffer
+	jsonBuf := jsonBufferPool.Get().(*bytes.Buffer)
+	jsonBuf.Reset()
+	defer jsonBufferPool.Put(jsonBuf)
 
-	// Encode the log entry
+	// Encode JSON efficiently
+	encoder := json.NewEncoder(jsonBuf)
 	if err := encoder.Encode(entry); err != nil {
-		fmt.Printf("Error marshaling log entry: %v\n", err)
+		fmt.Printf("Error encoding log entry: %v\n", err)
 		return
 	}
 
-	// Write the buffer to the output
-	_, err := l.output.Write(buf.Bytes())
+	// Write encoded data to output
+	_, err := l.output.Write(jsonBuf.Bytes())
 	if err != nil {
 		fmt.Printf("Error writing log entry: %v\n", err)
 	}

@@ -16,6 +16,13 @@ var (
 	once                     sync.Once
 )
 
+// Add a sync.Pool for WebSocket message buffers at the top of ws.go
+var wsMessagePool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 64*1024) // 64KB buffer for WebSocket messages
+	},
+}
+
 // Initialize the message pool (add this global variable at the top of ws.go)
 var (
 	messagePool = sync.Pool{
@@ -155,14 +162,13 @@ func (c *wsConnection) readPumpWithConfig(handler WSHandler, config wsConfig) {
 
 	c.SetReadLimit(config.MessageSize)
 	c.SetReadDeadline(time.Now().Add(config.PongWait))
-
 	c.SetPongHandler(func(string) error {
 		c.SetReadDeadline(time.Now().Add(config.PongWait))
 		return nil
 	})
 
 	for {
-		// Use the blank identifier to ignore messageType
+		// ReadMessage returns the messageType and message bytes
 		_, message, err := c.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err,
@@ -177,14 +183,15 @@ func (c *wsConnection) readPumpWithConfig(handler WSHandler, config wsConfig) {
 			return
 		}
 
-		// Get a message buffer from the pool
-		msg := messagePool.Get().([]byte)
-		copy(msg, message) // Copy the message to the pooled buffer
+		// Get a buffer from the pool
+		buf := wsMessagePool.Get().([]byte)
+		buf = append(buf[:0], message...) // Copy message into the pooled buffer
 
-		handler.OnMessage(c, msg)
+		// Handle the message
+		handler.OnMessage(c, buf[:len(message)])
 
 		// Return the buffer to the pool
-		messagePool.Put(msg[:len(message)])
+		wsMessagePool.Put(buf)
 	}
 }
 
