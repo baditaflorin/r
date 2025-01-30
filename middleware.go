@@ -454,7 +454,7 @@ func (m *standardMiddleware) RequestID() MiddlewareFunc {
 		requestID := c.RequestID()
 		if requestID == "" {
 			requestID = uuid.New().String()
-			ctx := c.(*contextImpl)
+			ctx := c.(*ContextImpl)
 			ctx.requestID = requestID
 		}
 		c.SetHeader("X-Request-ID", requestID)
@@ -621,7 +621,7 @@ func (m *standardMiddleware) CircuitBreaker(opts ...CircuitBreakerOption) Middle
 		defer cancel()
 
 		// Replace original context
-		c.(*contextImpl).ctx = ctx
+		c.(*ContextImpl).ctx = ctx
 
 		// Execute handler with panic recovery
 		var handlerError error

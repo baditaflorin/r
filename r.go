@@ -75,7 +75,7 @@ type HandlerFunc = MiddlewareFunc
 // MiddlewareFunc defines HTTP middleware
 type MiddlewareFunc func(Context)
 
-func (c *contextImpl) Request() *http.Request {
+func (c *ContextImpl) Request() *http.Request {
 	// Convert fasthttp.RequestCtx to http.Request
 	// This is a simplified version - you might want to add more fields
 	r := &http.Request{
@@ -87,15 +87,15 @@ func (c *contextImpl) Request() *http.Request {
 	return r
 }
 
-func (c *contextImpl) GetRequestID() string {
+func (c *ContextImpl) GetRequestID() string {
 	return c.requestID
 }
 
-func (c *contextImpl) RequestCtx() *fasthttp.RequestCtx {
+func (c *ContextImpl) RequestCtx() *fasthttp.RequestCtx {
 	return c.Context.RequestCtx
 }
 
-func (c *contextImpl) JSON(code int, v interface{}) error {
+func (c *ContextImpl) JSON(code int, v interface{}) error {
 	c.Context.RequestCtx.Response.Header.SetContentType("application/json")
 	c.Context.RequestCtx.Response.SetStatusCode(code)
 
@@ -114,13 +114,13 @@ func (c *contextImpl) JSON(code int, v interface{}) error {
 	return nil
 }
 
-func (c *contextImpl) String(code int, s string) error {
+func (c *ContextImpl) String(code int, s string) error {
 	c.Context.RequestCtx.Response.SetStatusCode(code)
 	c.Context.RequestCtx.Response.SetBodyString(s)
 	return nil
 }
 
-func (c *contextImpl) Next() {
+func (c *ContextImpl) Next() {
 	c.handlerIdx++
 	for c.handlerIdx < len(c.handlers) {
 		c.handlers[c.handlerIdx](c)

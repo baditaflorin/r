@@ -169,7 +169,7 @@ func (r *RouterImpl) wrapHandlers(handlers ...HandlerFunc) []routing.Handler {
 
 		wrapped[i] = func(c *routing.Context) error {
 			// Get contextImpl from sync.Pool
-			ctx := contextPool.Get().(*contextImpl)
+			ctx := contextPool.Get().(*ContextImpl)
 			ctx.Context = c
 			ctx.router = r
 			ctx.handlers = []HandlerFunc{handler}

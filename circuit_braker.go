@@ -14,118 +14,130 @@ type CircuitBreaker struct {
 	halfOpenMax  int64
 	metrics      MetricsCollector
 	state        atomic.Int32
-	stopMonitor  chan struct{} // New field for stopping the monitor
-	doneMonitor  chan struct{} // NEW channel for signaling when MonitorLoop is done
-
+	stopMonitor  chan struct{}
+	doneMonitor  chan struct{}
 }
 
 const (
-	StateOpen = iota
-	StateHalfOpen
-	StateClosed
+	StateClosed   = iota // 0: Normal operation
+	StateHalfOpen        // 1: Testing the waters
+	StateOpen            // 2: Circuit is broken
 )
 
+// IsOpen returns true if the circuit breaker is open (not allowing requests)
 func (cb *CircuitBreaker) IsOpen() bool {
-	currentState := cb.state.Load() // Load state only once
+	currentState := cb.state.Load()
 
-	switch currentState {
-	case StateOpen:
-		lastFailureTime := cb.lastFailure.Load() // Load lastFailure once
+	// First check if we're in OPEN state and should transition to HALF-OPEN
+	if currentState == StateOpen {
+		lastFailureTime := cb.lastFailure.Load()
 		lastFailure := time.Unix(0, lastFailureTime)
 
 		if time.Since(lastFailure) > cb.resetTimeout {
+			// Try transition to half-open
 			if cb.state.CompareAndSwap(StateOpen, StateHalfOpen) {
-				cb.successes.Store(0)
+				cb.successes.Store(0) // Reset success counter
 				if cb.metrics != nil {
 					cb.metrics.IncrementCounter("circuit_breaker.state_change",
 						map[string]string{"from": "open", "to": "half-open"})
 				}
-			}
-			return false
-		}
-		return true
-
-	case StateHalfOpen:
-		if cb.successes.Load() >= cb.halfOpenMax {
-			if cb.state.CompareAndSwap(StateHalfOpen, StateClosed) {
-				cb.failures.Store(0)
-				if cb.metrics != nil {
-					cb.metrics.IncrementCounter("circuit_breaker.state_change",
-						map[string]string{"from": "half-open", "to": "closed"})
-				}
+				return false // Allow requests through in half-open state
 			}
 		}
-		return false
-
-	default:
-		return false
+		return true // Still in open state, reject requests
 	}
+
+	return false // Allow requests in HALF-OPEN or CLOSED states
 }
 
-// Atomic getter for state
 func (cb *CircuitBreaker) GetState() int32 {
 	return cb.state.Load()
 }
 
-// Atomic setter for state
-func (cb *CircuitBreaker) SetState(newState int32) {
-	cb.state.Store(newState)
-}
-
-const maxBackoff = 5 * time.Minute // Maximum backoff duration
+const maxBackoff = 5 * time.Minute
 
 func (cb *CircuitBreaker) RecordFailure() {
 	failures := cb.failures.Add(1)
-
-	// Store last failure timestamp atomically
 	cb.lastFailure.Store(time.Now().UnixNano())
 
-	// Convert atomic value properly
-	currentTimeout := time.Duration(atomic.LoadInt64((*int64)(&cb.resetTimeout)))
-	newTimeout := currentTimeout * 2
-	if newTimeout > maxBackoff {
-		newTimeout = maxBackoff
+	if failures >= cb.threshold {
+		currentState := cb.state.Load()
+		if currentState != StateOpen {
+			// Transition to open state if we hit the threshold
+			if cb.state.CompareAndSwap(currentState, StateOpen) {
+				if cb.metrics != nil {
+					cb.metrics.IncrementCounter("circuit_breaker.state_change",
+						map[string]string{
+							"from": func() string {
+								switch currentState {
+								case StateClosed:
+									return "closed"
+								case StateHalfOpen:
+									return "half-open"
+								default:
+									return "unknown"
+								}
+							}(),
+							"to": "open",
+						})
+				}
+			}
+		}
 	}
-
-	atomic.StoreInt64((*int64)(&cb.resetTimeout), int64(newTimeout))
 
 	if cb.metrics != nil {
 		cb.metrics.IncrementCounter("circuit_breaker.failure", nil)
 	}
-
-	if failures >= cb.threshold {
-		if cb.state.CompareAndSwap(StateClosed, StateOpen) ||
-			cb.state.CompareAndSwap(StateHalfOpen, StateOpen) {
-			if cb.metrics != nil {
-				cb.metrics.IncrementCounter("circuit_breaker.state_change",
-					map[string]string{"to": "open"})
-			}
-		}
-	}
 }
 
 func (cb *CircuitBreaker) RecordSuccess() {
-	if cb.state.Load() == StateHalfOpen {
-		successes := cb.successes.Add(1)
-		if successes >= cb.halfOpenMax {
+	currentState := cb.state.Load()
+
+	switch currentState {
+	case StateHalfOpen:
+		newSuccesses := cb.successes.Add(1)
+		if newSuccesses >= cb.halfOpenMax {
+			// Attempt transition to closed state
 			if cb.state.CompareAndSwap(StateHalfOpen, StateClosed) {
-				cb.failures.Store(0)
+				cb.failures.Store(0)  // Reset failure counter
+				cb.successes.Store(0) // Reset success counter
 				if cb.metrics != nil {
 					cb.metrics.IncrementCounter("circuit_breaker.state_change",
 						map[string]string{"from": "half-open", "to": "closed"})
 				}
 			}
 		}
-	} else {
-		cb.successes.Store(0) // Reset success streak
+
+	case StateClosed:
+		// In closed state, just reset failure counter on success
+		cb.failures.Store(0)
+
+	case StateOpen:
+		// This shouldn't happen normally
+		if cb.metrics != nil {
+			cb.metrics.IncrementCounter("circuit_breaker.unexpected_success",
+				map[string]string{"state": "open"})
+		}
 	}
 
 	if cb.metrics != nil {
-		cb.metrics.IncrementCounter("circuit_breaker.success", nil)
+		cb.metrics.IncrementCounter("circuit_breaker.success",
+			map[string]string{"state": stateToString(currentState)})
 	}
 }
 
-// Add constructor for better encapsulation
+func stateToString(state int32) string {
+	switch state {
+	case StateClosed:
+		return "closed"
+	case StateHalfOpen:
+		return "half-open"
+	case StateOpen:
+		return "open"
+	default:
+		return "unknown"
+	}
+}
 func NewCircuitBreaker(threshold int64, resetTimeout time.Duration, metrics MetricsCollector) *CircuitBreaker {
 	cb := &CircuitBreaker{
 		threshold:    threshold,
@@ -133,22 +145,31 @@ func NewCircuitBreaker(threshold int64, resetTimeout time.Duration, metrics Metr
 		metrics:      metrics,
 		halfOpenMax:  2,
 		stopMonitor:  make(chan struct{}),
-		doneMonitor:  make(chan struct{}), // Initialize
-
+		doneMonitor:  make(chan struct{}),
 	}
 
-	// Start a single monitoring loop
+	// Start in closed state
+	cb.state.Store(StateClosed)
 	go cb.MonitorLoop()
 
 	return cb
 }
 
-// Run MonitorState at a fixed interval instead of triggering multiple times
+func (cb *CircuitBreaker) MonitorState() {
+	if cb.metrics == nil {
+		return
+	}
+
+	status := cb.GetStatus()
+	cb.metrics.RecordValue("circuit_breaker.error_rate", status.ErrorPercentage, nil)
+	cb.metrics.RecordValue("circuit_breaker.failures", float64(status.Failures), nil)
+}
+
 func (cb *CircuitBreaker) MonitorLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer func() {
 		ticker.Stop()
-		close(cb.doneMonitor) // Signal that the loop is done
+		close(cb.doneMonitor)
 	}()
 
 	for {
@@ -200,35 +221,8 @@ func (cb *CircuitBreaker) GetStatus() CircuitBreakerStatus {
 	}
 }
 
-func (cb *CircuitBreaker) MonitorState() {
-	if cb.metrics == nil {
-		return
-	}
-
-	status := cb.GetStatus()
-
-	cb.metrics.RecordValue("circuit_breaker.error_rate", status.ErrorPercentage, nil)
-	cb.metrics.RecordValue("circuit_breaker.total_requests", float64(status.TotalRequests), nil)
-	cb.metrics.RecordValue("circuit_breaker.failures", float64(status.Failures), nil)
-
-	stateMetric := 0.0
-	switch status.State {
-	case "OPEN":
-		stateMetric = 2.0
-	case "HALF-OPEN":
-		stateMetric = 1.0
-	case "CLOSED":
-		stateMetric = 0.0
-	}
-
-	cb.metrics.RecordValue("circuit_breaker.state", stateMetric, nil)
-}
-
 func (cb *CircuitBreaker) Close() error {
-	// Signal the MonitorLoop to stop
 	close(cb.stopMonitor)
-
-	// Wait for MonitorLoop to signal it's fully done
 	<-cb.doneMonitor
 	return nil
 }

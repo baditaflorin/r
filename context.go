@@ -42,8 +42,8 @@ type Context interface {
 	Get(key string) (interface{}, bool)
 }
 
-// contextImpl implements the enhanced Context interface
-type contextImpl struct {
+// ContextImpl implements the enhanced Context interface
+type ContextImpl struct {
 	*routing.Context
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -77,7 +77,7 @@ type tracingSpan struct {
 	children  []*tracingSpan
 }
 
-func (c *contextImpl) AddSpan(name string, metadata map[string]string) {
+func (c *ContextImpl) AddSpan(name string, metadata map[string]string) {
 	span := &tracingSpan{
 		name:      name,
 		startTime: time.Now(),
@@ -88,14 +88,14 @@ func (c *contextImpl) AddSpan(name string, metadata map[string]string) {
 
 var contextPool = sync.Pool{
 	New: func() interface{} {
-		return &contextImpl{}
+		return &ContextImpl{}
 	},
 }
 
-func newContextImpl(c *routing.Context) *contextImpl {
+func newContextImpl(c *routing.Context) *ContextImpl {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
-	impl := contextPool.Get().(*contextImpl)
+	impl := contextPool.Get().(*ContextImpl)
 	impl.Context = c
 	impl.ctx = ctx
 	impl.cancel = cancel
@@ -126,7 +126,7 @@ func newContextImpl(c *routing.Context) *contextImpl {
 	return impl
 }
 
-func (c *contextImpl) cleanup() {
+func (c *ContextImpl) cleanup() {
 	// Ensure cancel is called
 	if c.cancel != nil {
 		c.cancel()
@@ -184,7 +184,7 @@ func (c *contextImpl) cleanup() {
 	}
 }
 
-func (c *contextImpl) startSpan(name string, attributes map[string]string) *tracingSpan {
+func (c *ContextImpl) startSpan(name string, attributes map[string]string) *tracingSpan {
 	span := &tracingSpan{
 		name:      name,
 		startTime: time.Now(),
@@ -212,12 +212,12 @@ func (c *contextImpl) startSpan(name string, attributes map[string]string) *trac
 	return span
 }
 
-func (c *contextImpl) WithTimeout(timeout time.Duration) (Context, context.CancelFunc) {
+func (c *ContextImpl) WithTimeout(timeout time.Duration) (Context, context.CancelFunc) {
 	// Create new timeout context
 	timeoutCtx, cancel := context.WithTimeout(c.ctx, timeout)
 
 	// Create new context impl with timeout
-	newCtx := &contextImpl{
+	newCtx := &ContextImpl{
 		Context:   c.Context,
 		ctx:       timeoutCtx,
 		cancel:    cancel,
@@ -240,34 +240,34 @@ func (c *contextImpl) WithTimeout(timeout time.Duration) (Context, context.Cance
 }
 
 // Implement Context interface methods
-func (c *contextImpl) Deadline() (deadline time.Time, ok bool) {
+func (c *ContextImpl) Deadline() (deadline time.Time, ok bool) {
 	return c.ctx.Deadline()
 }
 
-func (c *contextImpl) Done() <-chan struct{} {
+func (c *ContextImpl) Done() <-chan struct{} {
 	return c.ctx.Done()
 }
 
-func (c *contextImpl) Err() error {
+func (c *ContextImpl) Err() error {
 	return c.ctx.Err()
 }
 
-func (c *contextImpl) Value(key interface{}) interface{} {
+func (c *ContextImpl) Value(key interface{}) interface{} {
 	return c.ctx.Value(key)
 }
 
-func (c *contextImpl) QueryParam(name string) string {
+func (c *ContextImpl) QueryParam(name string) string {
 	return string(c.QueryArgs().Peek(name))
 }
 
-func (c *contextImpl) Stream(code int, contentType string, reader io.Reader) error {
+func (c *ContextImpl) Stream(code int, contentType string, reader io.Reader) error {
 	c.Response.Header.SetContentType(contentType)
 	c.Response.SetStatusCode(code)
 	_, err := io.Copy(c.Response.BodyWriter(), reader)
 	return err
 }
 
-func (c *contextImpl) RealIP() string {
+func (c *ContextImpl) RealIP() string {
 	if ip := c.RequestCtx().Request.Header.Peek("X-Real-IP"); len(ip) > 0 {
 		return string(ip)
 	}
@@ -277,15 +277,15 @@ func (c *contextImpl) RealIP() string {
 	return c.RemoteIP().String()
 }
 
-func (c *contextImpl) IsWebSocket() bool {
+func (c *ContextImpl) IsWebSocket() bool {
 	return bytes.Equal(c.RequestCtx().Request.Header.Peek("Upgrade"), []byte("websocket"))
 }
 
-func (c *contextImpl) Abort() {
+func (c *ContextImpl) Abort() {
 	c.aborted = true
 }
 
-func (c *contextImpl) AbortWithError(code int, err error) {
+func (c *ContextImpl) AbortWithError(code int, err error) {
 	c.errorCause = err
 	c.errorStack = append(c.errorStack, fmt.Sprintf("%v", err))
 	if stackTrace := debug.Stack(); len(stackTrace) > 0 {
@@ -302,65 +302,69 @@ func (c *contextImpl) AbortWithError(code int, err error) {
 	}
 }
 
-func (c *contextImpl) Error() error {
+func (c *ContextImpl) Error() error {
 	return c.err
 }
 
-func (c *contextImpl) Cookie(name string) string {
+func (c *ContextImpl) Cookie(name string) string {
 	return string(c.RequestCtx().Request.Header.Cookie(name))
 }
 
-func (c *contextImpl) SetCookie(cookie *fasthttp.Cookie) {
+func (c *ContextImpl) SetCookie(cookie *fasthttp.Cookie) {
 	c.Response.Header.SetCookie(cookie)
 }
 
-func (c *contextImpl) SetHeader(key, value string) {
-	c.Response.Header.Set(key, value)
+func (c *ContextImpl) SetHeader(key, value string) {
+	c.RequestCtx().Response.Header.Set(key, value)
 }
 
-func (c *contextImpl) GetHeader(key string) string {
-	return string(c.RequestCtx().Request.Header.Peek(key))
+func (c *ContextImpl) GetHeader(key string) string {
+	// First try request headers
+	if value := c.RequestCtx().Request.Header.Peek(key); len(value) > 0 {
+		return string(value)
+	}
+	// Then try response headers
+	return string(c.RequestCtx().Response.Header.Peek(key))
 }
-
-func (c *contextImpl) RequestID() string {
+func (c *ContextImpl) RequestID() string {
 	if c.requestID == "" {
 		c.requestID = uuid.New().String()
 	}
 	return c.requestID
 }
 
-func (c *contextImpl) Path() string {
+func (c *ContextImpl) Path() string {
 	return string(c.RequestCtx().Request.URI().Path())
 }
 
-func (c *contextImpl) Method() string {
+func (c *ContextImpl) Method() string {
 	return string(c.RequestCtx().Method())
 }
 
 // Update Get method to use sync.Map methods
-func (c *contextImpl) Get(key string) (interface{}, bool) {
+func (c *ContextImpl) Get(key string) (interface{}, bool) {
 	return c.store.Load(key)
 }
 
-func (c *contextImpl) Set(key string, value interface{}) {
+func (c *ContextImpl) Set(key string, value interface{}) {
 	c.store.Store(key, value)
 }
 
-func (c *contextImpl) Redirect(code int, url string) error {
+func (c *ContextImpl) Redirect(code int, url string) error {
 	c.Response.Header.Set("Location", url)
 	c.Response.SetStatusCode(code)
 	return nil
 }
 
-func (c *contextImpl) GetTraceID() string {
+func (c *ContextImpl) GetTraceID() string {
 	return c.traceID
 }
 
-func (c *contextImpl) GetSpans() []*tracingSpan {
+func (c *ContextImpl) GetSpans() []*tracingSpan {
 	return c.spans
 }
 
-func (c *contextImpl) EndSpan(name string) {
+func (c *ContextImpl) EndSpan(name string) {
 	for _, span := range c.spans {
 		if span.name == name && span.endTime.IsZero() {
 			span.endTime = time.Now()
@@ -379,4 +383,9 @@ func (c *contextImpl) EndSpan(name string) {
 			break
 		}
 	}
+}
+
+// NewTestContext creates a new context implementation for testing
+func NewTestContext(c *routing.Context) *ContextImpl {
+	return newContextImpl(c)
 }
