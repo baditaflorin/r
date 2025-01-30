@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"math"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -625,6 +626,14 @@ func (m *standardMiddleware) CircuitBreaker(opts ...CircuitBreakerOption) Middle
 								"method": method,
 							})
 					}
+					// Log stack trace for panic
+					if m.logger != nil {
+						m.logger.Error("Panic in circuit breaker handler",
+							"error", handlerError,
+							"stack", string(debug.Stack()),
+							"path", path,
+							"method", method)
+					}
 				}
 			}()
 			c.Next()
@@ -640,19 +649,76 @@ func (m *standardMiddleware) CircuitBreaker(opts ...CircuitBreakerOption) Middle
 			circuitBreaker.recordFailure()
 
 			if m.metrics != nil {
-				m.metrics.IncrementCounter("circuit_breaker.failures",
-					map[string]string{
-						"path":   path,
-						"method": method,
-						"reason": handlerError.Error(),
-					})
+				tags := map[string]string{
+					"path":   path,
+					"method": method,
+				}
+
+				if handlerError != nil {
+					tags["reason"] = handlerError.Error()
+					tags["type"] = "error"
+				} else {
+					tags["reason"] = "timeout"
+					tags["type"] = "timeout"
+				}
+
+				m.metrics.IncrementCounter("circuit_breaker.failures", tags)
+				m.metrics.RecordTiming("circuit_breaker.error_latency",
+					duration, tags)
 			}
+
+			// Log detailed error information
+			if m.logger != nil {
+				m.logger.Error("Circuit breaker failure",
+					"error", handlerError,
+					"duration", duration,
+					"timeout", config.Timeout,
+					"path", path,
+					"method", method)
+			}
+
+			// Trigger immediate state monitoring on failure
+			circuitBreaker.monitorState()
 		} else {
 			circuitBreaker.recordSuccess()
 
 			if m.metrics != nil {
+				tags := map[string]string{
+					"path":   path,
+					"method": method,
+				}
+
 				m.metrics.RecordTiming("circuit_breaker.success_latency",
-					duration,
+					duration, tags)
+				m.metrics.IncrementCounter("circuit_breaker.successes", tags)
+
+				// Record response time histogram
+				buckets := []float64{10, 50, 100, 200, 500, 1000} // ms
+				for _, bucket := range buckets {
+					if duration.Milliseconds() <= int64(bucket) {
+						m.metrics.IncrementCounter(
+							fmt.Sprintf("circuit_breaker.latency_le_%v", bucket),
+							tags)
+					}
+				}
+			}
+		}
+
+		// Add request completion metrics
+		if m.metrics != nil {
+			m.metrics.RecordValue("circuit_breaker.request_duration_seconds",
+				duration.Seconds(),
+				map[string]string{
+					"path":   path,
+					"method": method,
+					"status": fmt.Sprintf("%d", c.RequestCtx().Response.StatusCode()),
+				})
+		}
+
+		// Check for context cancellation
+		if ctx.Err() != nil {
+			if m.metrics != nil {
+				m.metrics.IncrementCounter("circuit_breaker.context_cancelled",
 					map[string]string{
 						"path":   path,
 						"method": method,

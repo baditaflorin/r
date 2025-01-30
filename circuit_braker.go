@@ -14,6 +14,7 @@ type CircuitBreaker struct {
 	halfOpenMax  int64
 	metrics      MetricsCollector
 	state        atomic.Int32
+	stopMonitor  chan struct{} // New field for stopping the monitor
 }
 
 const (
@@ -34,6 +35,8 @@ func (cb *CircuitBreaker) isOpen() bool {
 					cb.metrics.IncrementCounter("circuit_breaker.state_change",
 						map[string]string{"from": "open", "to": "half-open"})
 				}
+				// Trigger immediate state monitoring on transition
+				cb.monitorState()
 			}
 			return false
 		}
@@ -41,7 +44,6 @@ func (cb *CircuitBreaker) isOpen() bool {
 	}
 
 	if currentState == stateHalfOpen {
-		// Only allow halfOpenMax requests in half-open state
 		currentSuccesses := cb.successes.Load()
 		if currentSuccesses >= cb.halfOpenMax {
 			if cb.state.CompareAndSwap(stateHalfOpen, stateClosed) {
@@ -50,6 +52,8 @@ func (cb *CircuitBreaker) isOpen() bool {
 					cb.metrics.IncrementCounter("circuit_breaker.state_change",
 						map[string]string{"from": "half-open", "to": "closed"})
 				}
+				// Trigger immediate state monitoring on transition
+				cb.monitorState()
 			}
 		}
 		return false
@@ -73,6 +77,8 @@ func (cb *CircuitBreaker) recordFailure() {
 				cb.metrics.IncrementCounter("circuit_breaker.state_change",
 					map[string]string{"to": "open"})
 			}
+			// Trigger immediate state monitoring on transition
+			cb.monitorState()
 		}
 	}
 }
@@ -89,10 +95,96 @@ func (cb *CircuitBreaker) recordSuccess() {
 
 // Add constructor for better encapsulation
 func NewCircuitBreaker(threshold int64, resetTimeout time.Duration, metrics MetricsCollector) *CircuitBreaker {
-	return &CircuitBreaker{
+	cb := &CircuitBreaker{
 		threshold:    threshold,
 		resetTimeout: resetTimeout,
 		metrics:      metrics,
-		halfOpenMax:  2, // Default value for half-open state max requests
+		halfOpenMax:  2,
+		stopMonitor:  make(chan struct{}),
 	}
+
+	// Start the monitoring goroutine
+	go cb.startStateMonitor()
+
+	return cb
+}
+
+type CircuitBreakerStatus struct {
+	State           string    `json:"state"`
+	Failures        int64     `json:"failures"`
+	LastFailure     time.Time `json:"last_failure"`
+	SuccessStreak   int64     `json:"success_streak"`
+	TotalRequests   int64     `json:"total_requests"`
+	ErrorPercentage float64   `json:"error_percentage"`
+}
+
+func (cb *CircuitBreaker) GetStatus() CircuitBreakerStatus {
+	currentState := cb.state.Load()
+	var stateName string
+	switch currentState {
+	case stateOpen:
+		stateName = "OPEN"
+	case stateHalfOpen:
+		stateName = "HALF-OPEN"
+	case stateClosed:
+		stateName = "CLOSED"
+	}
+
+	failures := cb.failures.Load()
+	successes := cb.successes.Load()
+	total := failures + successes
+	errorRate := 0.0
+	if total > 0 {
+		errorRate = float64(failures) / float64(total) * 100
+	}
+
+	return CircuitBreakerStatus{
+		State:           stateName,
+		Failures:        failures,
+		LastFailure:     time.Unix(0, cb.lastFailure.Load()),
+		SuccessStreak:   cb.successes.Load(),
+		TotalRequests:   total,
+		ErrorPercentage: errorRate,
+	}
+}
+
+func (cb *CircuitBreaker) monitorState() {
+	if cb.metrics == nil {
+		return
+	}
+
+	status := cb.GetStatus()
+	cb.metrics.RecordValue("circuit_breaker.error_rate", status.ErrorPercentage, nil)
+	cb.metrics.RecordValue("circuit_breaker.total_requests", float64(status.TotalRequests), nil)
+	cb.metrics.RecordValue("circuit_breaker.failures", float64(status.Failures), nil)
+
+	stateMetric := 0.0
+	switch status.State {
+	case "OPEN":
+		stateMetric = 2.0
+	case "HALF-OPEN":
+		stateMetric = 1.0
+	case "CLOSED":
+		stateMetric = 0.0
+	}
+	cb.metrics.RecordValue("circuit_breaker.state", stateMetric, nil)
+}
+
+func (cb *CircuitBreaker) startStateMonitor() {
+	ticker := time.NewTicker(time.Second * 15) // Monitor every 15 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			cb.monitorState()
+		case <-cb.stopMonitor:
+			return
+		}
+	}
+}
+
+func (cb *CircuitBreaker) Close() error {
+	close(cb.stopMonitor)
+	return nil
 }
