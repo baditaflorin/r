@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"time"
@@ -117,16 +118,30 @@ func (r *RouterImpl) WS(path string, handler WSHandler) Router {
 			logger = NewDefaultLogger()
 		}
 
+		// Check if we can accept new connections
+		if defaultConnectionManager != nil &&
+			defaultConnectionManager.activeConns.Load() >= defaultConnectionManager.maxConns {
+			return fmt.Errorf("maximum WebSocket connections reached")
+		}
+
 		err := r.upgrader.Upgrade(c.RequestCtx, func(conn *websocket.Conn) {
 			wsConn := newWSConnection(conn, logger)
+			if wsConn == nil {
+				logger.Error("Failed to create WebSocket connection")
+				return
+			}
+
 			handler.OnConnect(wsConn)
 
-			// Use readPumpWithConfig with default configuration
 			go wsConn.readPumpWithConfig(handler, defaultWSConfig())
 			go wsConn.writePump()
 		})
 
 		if err != nil {
+			logger.Error("WebSocket upgrade failed",
+				"error", err,
+				"path", path,
+				"remote_addr", c.RemoteIP().String())
 			return err
 		}
 		return nil

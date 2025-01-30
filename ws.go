@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+// Add as a package-level variable
+var (
+	defaultConnectionManager *ConnectionManager
+	once                     sync.Once
+)
+
 // WSHandler defines the interface for WebSocket event handling
 type WSHandler interface {
 	OnConnect(conn WSConnection)
@@ -55,22 +61,41 @@ const (
 	wsStateClosed  = 2
 )
 
+// Update the existing newWSConnection function to use connection manager
 func newWSConnection(conn *websocket.Conn, logger Logger) *wsConnection {
-	if logger == nil {
-		logger = NewDefaultLogger()
-	}
+	// Initialize the connection manager if not already done
+	once.Do(func() {
+		defaultConnectionManager = NewConnectionManager(
+			10000, // Default max connections
+			NewDefaultMetricsCollector(),
+			logger,
+		)
+	})
 
-	return &wsConnection{
+	wsConn := &wsConnection{
 		Conn:               conn,
 		id:                 uuid.New().String(),
 		send:               make(chan []byte, 256),
 		closeCh:            make(chan struct{}),
 		logger:             logger,
-		writeBuffer:        make(chan []byte, 1024),          // Buffer 1024 messages
-		rateLimiter:        time.NewTicker(time.Millisecond), // 1000 messages per second max
+		writeBuffer:        make(chan []byte, 1024),
+		rateLimiter:        time.NewTicker(time.Millisecond),
 		maxBufferSize:      1024,
 		dropMessagesOnFull: true,
 	}
+
+	// Add the connection to the manager
+	if err := defaultConnectionManager.Add(wsConn); err != nil {
+		if logger != nil {
+			logger.Error("Failed to add connection",
+				"error", err,
+				"conn_id", wsConn.id)
+		}
+		conn.Close()
+		return nil
+	}
+
+	return wsConn
 }
 
 func (c *wsConnection) ID() string {
@@ -198,6 +223,9 @@ func (c *wsConnection) Close() error {
 		close(c.closeCh)
 		err = c.Conn.Close()
 		c.state.Store(wsStateClosed)
+
+		// Remove from connection manager
+		defaultConnectionManager.Remove(c)
 
 		// Record metrics
 		if c.metrics != nil {
@@ -353,4 +381,145 @@ func (b *MessageBuffer) Len() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.count
+}
+
+type ConnectionManager struct {
+	connections sync.Map
+	metrics     MetricsCollector
+	logger      Logger
+	maxConns    int32
+	activeConns atomic.Int32
+}
+
+func NewConnectionManager(maxConns int32, metrics MetricsCollector, logger Logger) *ConnectionManager {
+	if logger == nil {
+		logger = NewDefaultLogger()
+	}
+
+	cm := &ConnectionManager{
+		maxConns: maxConns,
+		metrics:  metrics,
+		logger:   logger,
+	}
+
+	// Start periodic cleanup
+	go cm.periodicCleanup()
+	return cm
+}
+
+func (cm *ConnectionManager) Add(conn *wsConnection) error {
+	if cm.activeConns.Load() >= cm.maxConns {
+		if cm.metrics != nil {
+			cm.metrics.IncrementCounter("ws.connections.rejected",
+				map[string]string{"reason": "max_connections_reached"})
+		}
+		return fmt.Errorf("maximum connections reached")
+	}
+
+	cm.connections.Store(conn.ID(), conn)
+	count := cm.activeConns.Add(1)
+
+	if cm.metrics != nil {
+		cm.metrics.RecordValue("ws.connections.active", float64(count), nil)
+		cm.metrics.IncrementCounter("ws.connections.total", nil)
+	}
+
+	// Start connection monitoring
+	go cm.monitorConnection(conn)
+	return nil
+}
+
+func (cm *ConnectionManager) Remove(conn *wsConnection) {
+	cm.connections.Delete(conn.ID())
+	count := cm.activeConns.Add(-1)
+
+	if cm.metrics != nil {
+		cm.metrics.RecordValue("ws.connections.active", float64(count), nil)
+	}
+}
+
+func (cm *ConnectionManager) monitorConnection(conn *wsConnection) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check connection health
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				cm.logger.Error("Connection health check failed",
+					"conn_id", conn.ID(),
+					"error", err)
+				conn.Close()
+				cm.Remove(conn)
+				return
+			}
+		case <-conn.closeCh:
+			cm.Remove(conn)
+			return
+		}
+	}
+}
+
+func (cm *ConnectionManager) periodicCleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		staleCount := 0
+		cm.connections.Range(func(key, value interface{}) bool {
+			conn := value.(*wsConnection)
+			if time.Since(time.Unix(0, conn.lastPing.Load())) > 10*time.Minute {
+				cm.logger.Warn("Removing stale connection",
+					"conn_id", conn.ID(),
+					"last_ping", time.Unix(0, conn.lastPing.Load()))
+				conn.Close()
+				cm.Remove(conn)
+				staleCount++
+			}
+			return true
+		})
+
+		if cm.metrics != nil && staleCount > 0 {
+			cm.metrics.IncrementCounter("ws.connections.cleaned",
+				map[string]string{"count": fmt.Sprintf("%d", staleCount)})
+		}
+	}
+}
+
+func ConfigureConnectionManager(maxConns int32, metrics MetricsCollector, logger Logger) {
+	once.Do(func() {
+		defaultConnectionManager = NewConnectionManager(maxConns, metrics, logger)
+	})
+}
+
+func GetConnectionStats() map[string]interface{} {
+	if defaultConnectionManager == nil {
+		return nil
+	}
+
+	stats := map[string]interface{}{
+		"active_connections": defaultConnectionManager.activeConns.Load(),
+		"max_connections":    defaultConnectionManager.maxConns,
+	}
+
+	// Count connections by state
+	stateCount := make(map[string]int)
+	defaultConnectionManager.connections.Range(func(_, value interface{}) bool {
+		conn := value.(*wsConnection)
+		state := "unknown"
+		switch conn.state.Load() {
+		case wsStateActive:
+			state = "active"
+		case wsStateClosing:
+			state = "closing"
+		case wsStateClosed:
+			state = "closed"
+		}
+		stateCount[state]++
+		return true
+	})
+	stats["connections_by_state"] = stateCount
+
+	return stats
 }
