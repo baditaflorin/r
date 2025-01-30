@@ -42,6 +42,11 @@ type wsConnection struct {
 	state    atomic.Int32
 	lastPing atomic.Int64
 	msgCount atomic.Uint64
+
+	writeBuffer        chan []byte
+	rateLimiter        *time.Ticker
+	maxBufferSize      int
+	dropMessagesOnFull bool
 }
 
 const (
@@ -52,14 +57,19 @@ const (
 
 func newWSConnection(conn *websocket.Conn, logger Logger) *wsConnection {
 	if logger == nil {
-		logger = NewDefaultLogger() // Use default logger if none provided
+		logger = NewDefaultLogger()
 	}
+
 	return &wsConnection{
-		Conn:    conn,
-		id:      uuid.New().String(),
-		send:    make(chan []byte, 256),
-		closeCh: make(chan struct{}),
-		logger:  logger,
+		Conn:               conn,
+		id:                 uuid.New().String(),
+		send:               make(chan []byte, 256),
+		closeCh:            make(chan struct{}),
+		logger:             logger,
+		writeBuffer:        make(chan []byte, 1024),          // Buffer 1024 messages
+		rateLimiter:        time.NewTicker(time.Millisecond), // 1000 messages per second max
+		maxBufferSize:      1024,
+		dropMessagesOnFull: true,
 	}
 }
 
@@ -153,21 +163,30 @@ func (c *wsConnection) writePump() {
 
 	for {
 		select {
-		case message, ok := <-c.send:
-			if !ok {
-				c.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-
-			if err := c.WriteMessage(websocket.TextMessage, message); err != nil {
-				return
-			}
 		case <-ticker.C:
-			if err := c.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		case <-c.closeCh:
 			return
+		default:
+			// Try to read from buffer
+			select {
+			case msg := <-c.writeBuffer:
+				if err := c.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+					c.logger.Error("Failed to write WebSocket message",
+						"error", err,
+						"conn_id", c.id,
+					)
+					return
+				}
+
+				if c.metrics != nil {
+					c.metrics.IncrementCounter("ws.messages.sent", map[string]string{
+						"conn_id": c.id,
+					})
+				}
+			}
 		}
 	}
 }
@@ -190,4 +209,143 @@ func (c *wsConnection) Close() error {
 		}
 	})
 	return err
+}
+
+func (c *wsConnection) WriteMessage(messageType int, data []byte) error {
+	if c.state.Load() != wsStateActive {
+		return ErrConnectionClosed
+	}
+
+	select {
+	case <-c.rateLimiter.C:
+		select {
+		case c.writeBuffer <- data:
+			if c.metrics != nil {
+				c.metrics.IncrementCounter("ws.messages.buffered", map[string]string{
+					"conn_id": c.id,
+				})
+			}
+		default:
+			if c.dropMessagesOnFull {
+				if c.metrics != nil {
+					c.metrics.IncrementCounter("ws.messages.dropped", map[string]string{
+						"reason":  "buffer_full",
+						"conn_id": c.id,
+					})
+				}
+				return ErrBufferFull
+			}
+			// Wait for space
+			select {
+			case c.writeBuffer <- data:
+				// Message sent
+			case <-c.closeCh:
+				return ErrConnectionClosed
+			}
+		}
+
+		if c.metrics != nil {
+			c.metrics.IncrementCounter("ws.messages.buffered", map[string]string{
+				"conn_id": c.id,
+			})
+		}
+
+		return nil
+	default:
+		if c.metrics != nil {
+			c.metrics.IncrementCounter("ws.messages.dropped", map[string]string{
+				"reason":  "rate_limited",
+				"conn_id": c.id,
+			})
+		}
+		return ErrRateLimited
+	}
+}
+
+var (
+	ErrBufferFull       = fmt.Errorf("message buffer is full")
+	ErrConnectionClosed = fmt.Errorf("connection is closed")
+	ErrRateLimited      = fmt.Errorf("rate limit exceeded")
+)
+
+// MessageBuffer implements a fixed-size circular buffer for WebSocket messages
+type MessageBuffer struct {
+	buffer   [][]byte
+	size     int
+	head     int
+	tail     int
+	count    int
+	mu       sync.Mutex
+	notFull  chan struct{}
+	notEmpty chan struct{}
+}
+
+func NewMessageBuffer(size int) *MessageBuffer {
+	return &MessageBuffer{
+		buffer:   make([][]byte, size),
+		size:     size,
+		notFull:  make(chan struct{}, 1),
+		notEmpty: make(chan struct{}, 1),
+	}
+}
+
+func (b *MessageBuffer) Write(data []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.count == b.size {
+		return ErrBufferFull
+	}
+
+	// Make a copy of the data to prevent race conditions
+	msg := make([]byte, len(data))
+	copy(msg, data)
+
+	b.buffer[b.tail] = msg
+	b.tail = (b.tail + 1) % b.size
+	b.count++
+
+	// Signal that buffer is not empty
+	select {
+	case b.notEmpty <- struct{}{}:
+	default:
+	}
+
+	return nil
+}
+
+func (b *MessageBuffer) Read() ([]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.count == 0 {
+		return nil, nil
+	}
+
+	data := b.buffer[b.head]
+	b.buffer[b.head] = nil // Allow GC to reclaim the memory
+	b.head = (b.head + 1) % b.size
+	b.count--
+
+	// Signal that buffer is not full
+	select {
+	case b.notFull <- struct{}{}:
+	default:
+	}
+
+	return data, nil
+}
+
+func (b *MessageBuffer) NotFull() <-chan struct{} {
+	return b.notFull
+}
+
+func (b *MessageBuffer) NotEmpty() <-chan struct{} {
+	return b.notEmpty
+}
+
+func (b *MessageBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.count
 }
