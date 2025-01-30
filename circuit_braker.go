@@ -15,6 +15,8 @@ type CircuitBreaker struct {
 	metrics      MetricsCollector
 	state        atomic.Int32
 	stopMonitor  chan struct{} // New field for stopping the monitor
+	doneMonitor  chan struct{} // NEW channel for signaling when monitorLoop is done
+
 }
 
 const (
@@ -24,11 +26,13 @@ const (
 )
 
 func (cb *CircuitBreaker) isOpen() bool {
-	currentState := cb.getState()
+	currentState := cb.state.Load() // Load state only once
 
 	switch currentState {
 	case stateOpen:
-		lastFailure := time.Unix(0, cb.lastFailure.Load())
+		lastFailureTime := cb.lastFailure.Load() // Load lastFailure once
+		lastFailure := time.Unix(0, lastFailureTime)
+
 		if time.Since(lastFailure) > cb.resetTimeout {
 			if cb.state.CompareAndSwap(stateOpen, stateHalfOpen) {
 				cb.successes.Store(0)
@@ -76,12 +80,15 @@ func (cb *CircuitBreaker) recordFailure() {
 	// Store last failure timestamp atomically
 	cb.lastFailure.Store(time.Now().UnixNano())
 
-	// Exponential backoff mechanism
-	newTimeout := cb.resetTimeout * 2
+	// Exponential backoff mechanism (fixed)
+	currentTimeout := cb.resetTimeout
+	newTimeout := currentTimeout * 2
 	if newTimeout > maxBackoff {
 		newTimeout = maxBackoff
 	}
-	cb.resetTimeout = newTimeout
+
+	// Fix: Explicitly cast time.Duration to int64
+	atomic.CompareAndSwapInt64((*int64)(&cb.resetTimeout), int64(currentTimeout), int64(newTimeout))
 
 	if cb.metrics != nil {
 		cb.metrics.IncrementCounter("circuit_breaker.failure", nil)
@@ -116,6 +123,8 @@ func NewCircuitBreaker(threshold int64, resetTimeout time.Duration, metrics Metr
 		metrics:      metrics,
 		halfOpenMax:  2,
 		stopMonitor:  make(chan struct{}),
+		doneMonitor:  make(chan struct{}), // Initialize
+
 	}
 
 	// Start a single monitoring loop
@@ -126,15 +135,17 @@ func NewCircuitBreaker(threshold int64, resetTimeout time.Duration, metrics Metr
 
 // Run monitorState at a fixed interval instead of triggering multiple times
 func (cb *CircuitBreaker) monitorLoop() {
-	ticker := time.NewTicker(time.Second * 15) // Monitor every 15 seconds
-	defer ticker.Stop()
+	ticker := time.NewTicker(15 * time.Second)
+	defer func() {
+		ticker.Stop()
+		close(cb.doneMonitor) // Signal that the loop is done
+	}()
 
 	for {
 		select {
 		case <-ticker.C:
 			cb.monitorState()
 		case <-cb.stopMonitor:
-			close(cb.stopMonitor) // Ensure the channel is properly closed
 			return
 		}
 	}
@@ -186,51 +197,28 @@ func (cb *CircuitBreaker) monitorState() {
 
 	status := cb.GetStatus()
 
-	// Create a timeout context to prevent monitoring from hanging
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		cb.metrics.RecordValue("circuit_breaker.error_rate", status.ErrorPercentage, nil)
-		cb.metrics.RecordValue("circuit_breaker.total_requests", float64(status.TotalRequests), nil)
-		cb.metrics.RecordValue("circuit_breaker.failures", float64(status.Failures), nil)
+	cb.metrics.RecordValue("circuit_breaker.error_rate", status.ErrorPercentage, nil)
+	cb.metrics.RecordValue("circuit_breaker.total_requests", float64(status.TotalRequests), nil)
+	cb.metrics.RecordValue("circuit_breaker.failures", float64(status.Failures), nil)
 
-		stateMetric := 0.0
-		switch status.State {
-		case "OPEN":
-			stateMetric = 2.0
-		case "HALF-OPEN":
-			stateMetric = 1.0
-		case "CLOSED":
-			stateMetric = 0.0
-		}
-		cb.metrics.RecordValue("circuit_breaker.state", stateMetric, nil)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(500 * time.Millisecond): // Prevent blocking
-		if cb.metrics != nil {
-			cb.metrics.IncrementCounter("circuit_breaker.monitor_timeout", nil)
-		}
+	stateMetric := 0.0
+	switch status.State {
+	case "OPEN":
+		stateMetric = 2.0
+	case "HALF-OPEN":
+		stateMetric = 1.0
+	case "CLOSED":
+		stateMetric = 0.0
 	}
-}
 
-func (cb *CircuitBreaker) startStateMonitor() {
-	ticker := time.NewTicker(time.Second * 15) // Monitor every 15 seconds
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			cb.monitorState()
-		case <-cb.stopMonitor:
-			return
-		}
-	}
+	cb.metrics.RecordValue("circuit_breaker.state", stateMetric, nil)
 }
 
 func (cb *CircuitBreaker) Close() error {
+	// Signal the monitorLoop to stop
 	close(cb.stopMonitor)
-	<-time.After(100 * time.Millisecond) // Allow time for the goroutine to exit
+
+	// Wait for monitorLoop to signal it's fully done
+	<-cb.doneMonitor
 	return nil
 }
