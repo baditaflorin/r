@@ -1,12 +1,21 @@
 package r
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"runtime/debug"
 	"sync"
 	"time"
+)
+
+var (
+	bytesPool = sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
 )
 
 type LogEntry struct {
@@ -21,6 +30,11 @@ type LogEntry struct {
 	Path       string         `json:"path,omitempty"`
 	StackTrace string         `json:"stack_trace,omitempty"`
 }
+
+// Initialize the pools (add these global variables at the top of log.go)
+var (
+	jsonEncoderPool = sync.Pool{New: func() interface{} { return json.NewEncoder(&bytes.Buffer{}) }}
+)
 
 // structuredLogger implements the Logger interface with enhanced features
 type structuredLogger struct {
@@ -206,14 +220,22 @@ func (l *structuredLogger) writeEntry(entry *LogEntry) {
 		return
 	}
 
-	data, err := json.Marshal(entry)
-	if err != nil {
+	// Get a buffer from the pool
+	buf := bytesPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bytesPool.Put(buf)
+
+	// Create a new JSON encoder with the pooled buffer
+	encoder := json.NewEncoder(buf)
+
+	// Encode the log entry
+	if err := encoder.Encode(entry); err != nil {
 		fmt.Printf("Error marshaling log entry: %v\n", err)
 		return
 	}
 
-	data = append(data, '\n')
-	_, err = l.output.Write(data)
+	// Write the buffer to the output
+	_, err := l.output.Write(buf.Bytes())
 	if err != nil {
 		fmt.Printf("Error writing log entry: %v\n", err)
 	}

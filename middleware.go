@@ -16,6 +16,15 @@ import (
 	"time"
 )
 
+// Initialize the tags pool (add this global variable at the top of middleware.go)
+var (
+	tagsPool = sync.Pool{
+		New: func() interface{} {
+			return make(map[string]string, 2) // Preallocate with expected size
+		},
+	}
+)
+
 // MiddlewareProvider defines the interface for middleware functionality
 type MiddlewareProvider interface {
 	Logger(format string) MiddlewareFunc
@@ -370,6 +379,24 @@ func (m *standardMiddleware) RateLimit(reqs int, per time.Duration) MiddlewareFu
 
 	return func(c Context) {
 		if !m.rateLimiter.Allow(c.RealIP()) {
+			// Get a tags map from the pool
+			tags := tagsPool.Get().(map[string]string)
+			tags["key"] = c.RealIP()
+			tags["reason"] = "rate_limited"
+			defer func() {
+				// Clean up the map before putting it back
+				for k := range tags {
+					delete(tags, k)
+				}
+				tagsPool.Put(tags)
+			}()
+
+			// Increment counter using the MetricsCollector
+			if m.metrics != nil {
+				m.metrics.IncrementCounter("rate_limit_exceeded", tags)
+			}
+
+			// Abort the request with a 429 status code
 			c.AbortWithError(http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded"))
 			return
 		}

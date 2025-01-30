@@ -16,6 +16,16 @@ var (
 	once                     sync.Once
 )
 
+// Initialize the message pool (add this global variable at the top of ws.go)
+var (
+	messagePool = sync.Pool{
+		New: func() interface{} {
+			// Preallocate buffers of maximum expected message size
+			return make([]byte, 512*1024) // 512KB
+		},
+	}
+)
+
 // WSHandler defines the interface for WebSocket event handling
 type WSHandler interface {
 	OnConnect(conn WSConnection)
@@ -152,7 +162,8 @@ func (c *wsConnection) readPumpWithConfig(handler WSHandler, config wsConfig) {
 	})
 
 	for {
-		messageType, message, err := c.ReadMessage()
+		// Use the blank identifier to ignore messageType
+		_, message, err := c.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err,
 				websocket.CloseGoingAway,
@@ -166,15 +177,14 @@ func (c *wsConnection) readPumpWithConfig(handler WSHandler, config wsConfig) {
 			return
 		}
 
-		switch messageType {
-		case websocket.TextMessage, websocket.BinaryMessage:
-			handler.OnMessage(c, message)
-		default:
-			c.logger.WithFields(map[string]interface{}{
-				"type":      messageType,
-				"client_id": c.ID(),
-			}).Warn("Unsupported WebSocket message type")
-		}
+		// Get a message buffer from the pool
+		msg := messagePool.Get().([]byte)
+		copy(msg, message) // Copy the message to the pooled buffer
+
+		handler.OnMessage(c, msg)
+
+		// Return the buffer to the pool
+		messagePool.Put(msg[:len(message)])
 	}
 }
 
