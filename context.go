@@ -47,12 +47,46 @@ type contextImpl struct {
 	cancel     context.CancelFunc
 	handlers   []HandlerFunc
 	handlerIdx int
-	store      map[string]interface{}
-	storeMu    sync.Mutex
+	store      *sync.Map // Changed to pointer since sync.Map is meant to be used as a pointer
 	requestID  string
 	err        error
 	aborted    bool
 	router     *RouterImpl
+
+	// Add tracing and timing
+	startTime time.Time
+	spans     []*tracingSpan
+	timeouts  map[string]time.Duration
+	metrics   MetricsCollector
+}
+
+type tracingSpan struct {
+	name      string
+	startTime time.Time
+	endTime   time.Time
+	metadata  map[string]string
+}
+
+func (c *contextImpl) AddSpan(name string, metadata map[string]string) {
+	span := &tracingSpan{
+		name:      name,
+		startTime: time.Now(),
+		metadata:  metadata,
+	}
+	c.spans = append(c.spans, span)
+}
+
+func (c *contextImpl) EndSpan(name string) {
+	for _, span := range c.spans {
+		if span.name == name && span.endTime.IsZero() {
+			span.endTime = time.Now()
+			if c.metrics != nil {
+				c.metrics.RecordTiming("request.span."+name,
+					span.endTime.Sub(span.startTime))
+			}
+			break
+		}
+	}
 }
 
 func newContextImpl(c *routing.Context) *contextImpl {
@@ -62,8 +96,11 @@ func newContextImpl(c *routing.Context) *contextImpl {
 		ctx:       ctx,
 		cancel:    cancel,
 		requestID: uuid.New().String(),
-		store:     make(map[string]interface{}),
+		store:     &sync.Map{}, // Initialize as pointer
 		handlers:  make([]HandlerFunc, 0),
+		startTime: time.Now(),
+		spans:     make([]*tracingSpan, 0),
+		timeouts:  make(map[string]time.Duration),
 	}
 	return impl
 }
@@ -155,11 +192,13 @@ func (c *contextImpl) Method() string {
 	return string(c.RequestCtx().Method())
 }
 
+// Update Get method to use sync.Map methods
 func (c *contextImpl) Get(key string) (interface{}, bool) {
-	c.storeMu.Lock()
-	value, exists := c.store[key]
-	c.storeMu.Unlock()
-	return value, exists
+	return c.store.Load(key)
+}
+
+func (c *contextImpl) Set(key string, value interface{}) {
+	c.store.Store(key, value)
 }
 
 func (c *contextImpl) Redirect(code int, url string) error {

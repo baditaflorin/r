@@ -1,110 +1,211 @@
 package r
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
+	"runtime/debug"
+	"sync"
 	"time"
 )
 
-// LogConfig defines configuration options for logging
-type LogConfig struct {
-	Output      io.Writer
-	FilePath    string
-	JsonFormat  bool
-	AsyncWrite  bool
-	BufferSize  int
-	MaxFileSize int
-	MaxBackups  int
-	AddSource   bool
-	Metrics     bool
-	Level       LogLevel
+type LogEntry struct {
+	Level      LogLevel       `json:"level"`
+	Message    string         `json:"message"`
+	Time       time.Time      `json:"time"`
+	Fields     map[string]any `json:"fields,omitempty"`
+	Method     string         `json:"method,omitempty"`
+	Status     int            `json:"status,omitempty"`
+	Latency    time.Duration  `json:"latency,omitempty"`
+	IP         string         `json:"ip,omitempty"`
+	Path       string         `json:"path,omitempty"`
+	StackTrace string         `json:"stack_trace,omitempty"`
 }
 
-// LogLevel represents the severity of a log entry
-type LogLevel int
+// structuredLogger implements the Logger interface with enhanced features
+type structuredLogger struct {
+	output     io.Writer
+	level      LogLevel
+	fields     map[string]any
+	fieldsMu   sync.RWMutex
+	bufferPool sync.Pool
+}
 
-const (
-	DebugLevel LogLevel = iota
-	InfoLevel
-	WarnLevel
-	ErrorLevel
-	FatalLevel
-)
-
-func (l LogLevel) String() string {
-	switch l {
-	case DebugLevel:
-		return "debug"
-	case InfoLevel:
-		return "info"
-	case WarnLevel:
-		return "warn"
-	case ErrorLevel:
-		return "error"
-	case FatalLevel:
-		return "fatal"
-	default:
-		return "unknown"
+func NewStructuredLogger(output io.Writer, level LogLevel) Logger {
+	return &structuredLogger{
+		output: output,
+		level:  level,
+		fields: make(map[string]any),
+		bufferPool: sync.Pool{
+			New: func() interface{} {
+				return new(LogEntry)
+			},
+		},
 	}
 }
 
-// Logger interface defines common logging methods
-type Logger interface {
-	WithField(key string, value interface{}) Logger
-	WithFields(fields map[string]interface{}) Logger
-	WithError(err error) Logger
-	With(key string, value interface{}) Logger // Add this method
-	Configure(config LogConfig) error
-	Log(method string, status int, latency time.Duration, ip, path string)
-	Info(msg string, args ...interface{})
-	Error(msg string, args ...interface{})
-	Debug(msg string, args ...interface{})
-	Warn(msg string, args ...interface{})
-}
-
-// defaultLogger is a basic implementation of the Logger interface
-type defaultLogger struct{}
-
 func NewDefaultLogger() Logger {
-	return &defaultLogger{}
+	return &structuredLogger{
+		output: io.Discard,
+		level:  InfoLevel,
+		fields: make(map[string]any),
+		bufferPool: sync.Pool{
+			New: func() interface{} {
+				return new(LogEntry)
+			},
+		},
+	}
 }
 
-func (l *defaultLogger) WithField(key string, value interface{}) Logger {
-	return l
+func (l *structuredLogger) Log(method string, status int, latency time.Duration, ip, path string) {
+	entry := l.bufferPool.Get().(*LogEntry)
+	defer l.bufferPool.Put(entry)
+
+	*entry = LogEntry{
+		Level:   InfoLevel,
+		Time:    time.Now(),
+		Method:  method,
+		Status:  status,
+		Latency: latency,
+		IP:      ip,
+		Path:    path,
+		Fields:  l.getFields(),
+	}
+
+	l.writeEntry(entry)
 }
 
-func (l *defaultLogger) WithFields(fields map[string]interface{}) Logger {
-	return l
+func (l *structuredLogger) Info(msg string, args ...interface{}) {
+	entry := l.bufferPool.Get().(*LogEntry)
+	defer l.bufferPool.Put(entry)
+
+	*entry = LogEntry{
+		Level:   InfoLevel,
+		Message: fmt.Sprintf(msg, args...),
+		Time:    time.Now(),
+		Fields:  l.getFields(),
+	}
+
+	l.writeEntry(entry)
 }
 
-func (l *defaultLogger) WithError(err error) Logger {
-	return l
+func (l *structuredLogger) Error(msg string, args ...interface{}) {
+	entry := l.bufferPool.Get().(*LogEntry)
+	defer l.bufferPool.Put(entry)
+
+	*entry = LogEntry{
+		Level:      ErrorLevel,
+		Message:    fmt.Sprintf(msg, args...),
+		Time:       time.Now(),
+		Fields:     l.getFields(),
+		StackTrace: string(debug.Stack()),
+	}
+
+	l.writeEntry(entry)
 }
 
-func (l *defaultLogger) Configure(config LogConfig) error {
+func (l *structuredLogger) Debug(msg string, args ...interface{}) {
+	if l.level > DebugLevel {
+		return
+	}
+
+	entry := l.bufferPool.Get().(*LogEntry)
+	defer l.bufferPool.Put(entry)
+
+	*entry = LogEntry{
+		Level:   DebugLevel,
+		Message: fmt.Sprintf(msg, args...),
+		Time:    time.Now(),
+		Fields:  l.getFields(),
+	}
+
+	l.writeEntry(entry)
+}
+
+func (l *structuredLogger) Warn(msg string, args ...interface{}) {
+	entry := l.bufferPool.Get().(*LogEntry)
+	defer l.bufferPool.Put(entry)
+
+	*entry = LogEntry{
+		Level:   WarnLevel,
+		Message: fmt.Sprintf(msg, args...),
+		Time:    time.Now(),
+		Fields:  l.getFields(),
+	}
+
+	l.writeEntry(entry)
+}
+
+func (l *structuredLogger) WithField(key string, value interface{}) Logger {
+	newLogger := &structuredLogger{
+		output:     l.output,
+		level:      l.level,
+		fields:     l.cloneFields(),
+		bufferPool: l.bufferPool,
+	}
+	newLogger.fields[key] = value
+	return newLogger
+}
+
+func (l *structuredLogger) WithFields(fields map[string]interface{}) Logger {
+	newLogger := &structuredLogger{
+		output:     l.output,
+		level:      l.level,
+		fields:     l.cloneFields(),
+		bufferPool: l.bufferPool,
+	}
+	for k, v := range fields {
+		newLogger.fields[k] = v
+	}
+	return newLogger
+}
+
+func (l *structuredLogger) WithError(err error) Logger {
+	return l.WithField("error", err.Error())
+}
+
+func (l *structuredLogger) With(key string, value interface{}) Logger {
+	return l.WithField(key, value)
+}
+
+func (l *structuredLogger) Configure(config LogConfig) error {
+	l.output = config.Output
+	l.level = config.Level
 	return nil
 }
 
-func (l *defaultLogger) Log(method string, status int, latency time.Duration, ip, path string) {
-	fmt.Printf("%s | %3d | %13v | %15s | %s\n", method, status, latency, ip, path)
+// Helper methods
+func (l *structuredLogger) cloneFields() map[string]interface{} {
+	l.fieldsMu.RLock()
+	defer l.fieldsMu.RUnlock()
+
+	newFields := make(map[string]interface{}, len(l.fields))
+	for k, v := range l.fields {
+		newFields[k] = v
+	}
+	return newFields
 }
 
-func (l *defaultLogger) Info(msg string, args ...interface{}) {
-	fmt.Printf("INFO: "+msg+"\n", args...)
+func (l *structuredLogger) getFields() map[string]interface{} {
+	l.fieldsMu.RLock()
+	defer l.fieldsMu.RUnlock()
+	return l.fields
 }
 
-func (l *defaultLogger) Error(msg string, args ...interface{}) {
-	fmt.Printf("ERROR: "+msg+"\n", args...)
-}
+func (l *structuredLogger) writeEntry(entry *LogEntry) {
+	if l.output == nil {
+		return
+	}
 
-func (l *defaultLogger) Debug(msg string, args ...interface{}) {
-	fmt.Printf("DEBUG: "+msg+"\n", args...)
-}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		fmt.Printf("Error marshaling log entry: %v\n", err)
+		return
+	}
 
-func (l *defaultLogger) Warn(msg string, args ...interface{}) {
-	fmt.Printf("WARN: "+msg+"\n", args...)
-}
-
-func (l *defaultLogger) With(key string, value interface{}) Logger {
-	return l.WithField(key, value)
+	data = append(data, '\n')
+	_, err = l.output.Write(data)
+	if err != nil {
+		fmt.Printf("Error writing log entry: %v\n", err)
+	}
 }

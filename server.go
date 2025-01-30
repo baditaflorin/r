@@ -118,11 +118,29 @@ func (s *serverImpl) Start(address string) error {
 
 func (s *serverImpl) Stop() error {
 	s.mu.Lock()
+	if s.shutdown == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("server already stopped")
+	}
 	close(s.shutdown)
+	s.shutdown = nil
 	s.mu.Unlock()
+
+	// Signal all active connections to complete
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	return s.server.ShutdownWithContext(ctx)
+	// Wait for either graceful shutdown or timeout
+	select {
+	case <-done:
+		return s.server.ShutdownWithContext(ctx)
+	case <-ctx.Done():
+		return fmt.Errorf("shutdown timed out: %v", ctx.Err())
+	}
 }

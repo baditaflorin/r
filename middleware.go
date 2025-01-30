@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -83,18 +84,39 @@ func WithRateLimiter(rl RateLimiter) MiddlewareOption {
 // Default implementations
 
 type defaultRateLimiter struct {
-	tokens  map[string]float64
-	lastReq map[string]time.Time
-	maxRate float64
-	per     time.Duration
+	tokens      map[string]float64
+	lastReq     map[string]time.Time
+	maxRate     float64
+	per         time.Duration
+	mu          sync.RWMutex
+	cleanupTick *time.Ticker
 }
 
 func NewDefaultRateLimiter(reqs int, per time.Duration) RateLimiter {
-	return &defaultRateLimiter{
-		tokens:  make(map[string]float64),
-		lastReq: make(map[string]time.Time),
-		maxRate: float64(reqs),
-		per:     per,
+	rl := &defaultRateLimiter{
+		tokens:      make(map[string]float64),
+		lastReq:     make(map[string]time.Time),
+		maxRate:     float64(reqs),
+		per:         per,
+		cleanupTick: time.NewTicker(time.Minute * 5),
+	}
+
+	// Start cleanup goroutine
+	go rl.cleanup()
+	return rl
+}
+
+func (rl *defaultRateLimiter) cleanup() {
+	for range rl.cleanupTick.C {
+		rl.mu.Lock()
+		now := time.Now()
+		for ip, lastSeen := range rl.lastReq {
+			if now.Sub(lastSeen) > rl.per*2 {
+				delete(rl.tokens, ip)
+				delete(rl.lastReq, ip)
+			}
+		}
+		rl.mu.Unlock()
 	}
 }
 

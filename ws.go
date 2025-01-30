@@ -5,6 +5,8 @@ import (
 	"github.com/fasthttp/websocket"
 	"github.com/google/uuid"
 	"runtime/debug"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,11 +31,24 @@ type WSConnection interface {
 // wsConnection wraps a websocket connection
 type wsConnection struct {
 	*websocket.Conn
-	id      string
-	send    chan []byte
-	closeCh chan struct{}
-	logger  Logger
+	id        string
+	send      chan []byte
+	closeCh   chan struct{}
+	logger    Logger
+	closeOnce sync.Once
+	metrics   MetricsCollector
+
+	// Add connection state tracking
+	state    atomic.Int32
+	lastPing atomic.Int64
+	msgCount atomic.Uint64
 }
+
+const (
+	wsStateActive  = 0
+	wsStateClosing = 1
+	wsStateClosed  = 2
+)
 
 func newWSConnection(conn *websocket.Conn, logger Logger) *wsConnection {
 	if logger == nil {
@@ -155,4 +170,24 @@ func (c *wsConnection) writePump() {
 			return
 		}
 	}
+}
+
+func (c *wsConnection) Close() error {
+	var err error
+	c.closeOnce.Do(func() {
+		c.state.Store(wsStateClosing)
+		close(c.closeCh)
+		err = c.Conn.Close()
+		c.state.Store(wsStateClosed)
+
+		// Record metrics
+		if c.metrics != nil {
+			c.metrics.IncrementCounter("ws.connections.closed", map[string]string{
+				"id": c.id,
+			})
+			c.metrics.RecordTiming("ws.connection.duration",
+				time.Since(time.Unix(0, c.lastPing.Load())))
+		}
+	})
+	return err
 }

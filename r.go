@@ -53,13 +53,6 @@ type ErrorHandler interface {
 	WithLogger(Logger) ErrorHandler
 }
 
-// 9. Metrics Interface (new)
-type MetricsCollector interface {
-	IncrementCounter(name string, tags map[string]string)
-	RecordTiming(name string, duration time.Duration)
-	CollectMetrics() map[string]interface{}
-}
-
 // 10. Health Checker Interface (new)
 type HealthChecker interface {
 	Check() error
@@ -84,15 +77,6 @@ func (c *contextImpl) Request() *http.Request {
 		},
 	}
 	return r
-}
-
-func (c *contextImpl) Set(key string, value interface{}) {
-	c.storeMu.Lock()
-	if c.store == nil {
-		c.store = make(map[string]interface{})
-	}
-	c.store[key] = value
-	c.storeMu.Unlock()
 }
 
 func (c *contextImpl) GetRequestID() string {
