@@ -301,24 +301,37 @@ func (m *standardMiddleware) Security() MiddlewareFunc {
 
 func (m *standardMiddleware) Timeout(duration time.Duration) MiddlewareFunc {
 	return func(c Context) {
-		// Create a context with timeout
 		ctx, cancel := context.WithTimeout(c, duration)
 		defer cancel()
 
-		// Create a done channel to track completion
 		done := make(chan struct{})
+		errCh := make(chan error, 1)
 
 		go func() {
 			defer close(done)
+			defer func() {
+				if r := recover(); r != nil {
+					errCh <- fmt.Errorf("panic in handler: %v", r)
+				}
+			}()
 			c.Next()
+			errCh <- c.Error()
 		}()
 
 		select {
 		case <-ctx.Done():
-			c.AbortWithError(http.StatusGatewayTimeout, fmt.Errorf("request timeout after %v", duration))
+			c.AbortWithError(http.StatusGatewayTimeout, fmt.Errorf("request timeout after %v: %w", duration, ctx.Err()))
+			// Cleanup goroutine
+			go func() {
+				<-done
+			}()
+			return
+		case err := <-errCh:
+			if err != nil {
+				c.AbortWithError(http.StatusInternalServerError, err)
+			}
 			return
 		case <-done:
-			// Request completed within timeout
 			return
 		}
 	}

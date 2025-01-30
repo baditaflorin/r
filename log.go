@@ -53,6 +53,7 @@ type Logger interface {
 	WithField(key string, value interface{}) Logger
 	WithFields(fields map[string]interface{}) Logger
 	WithError(err error) Logger
+	With(key string, value interface{}) Logger // Add this method
 	Configure(config LogConfig) error
 	Log(method string, status int, latency time.Duration, ip, path string)
 	Info(msg string, args ...interface{})
@@ -102,4 +103,8 @@ func (l *defaultLogger) Debug(msg string, args ...interface{}) {
 
 func (l *defaultLogger) Warn(msg string, args ...interface{}) {
 	fmt.Printf("WARN: "+msg+"\n", args...)
+}
+
+func (l *defaultLogger) With(key string, value interface{}) Logger {
+	return l.WithField(key, value)
 }

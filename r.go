@@ -126,11 +126,19 @@ func (c *contextImpl) Next() {
 // WS implements Router.WS
 func (r *RouterImpl) WS(path string, handler WSHandler) Router {
 	r.group.Get(path, func(c *routing.Context) error {
+		var logger Logger
+		if l, ok := c.UserValue("logger").(Logger); ok {
+			logger = l
+		} else {
+			logger = NewDefaultLogger()
+		}
+
 		err := r.upgrader.Upgrade(c.RequestCtx, func(conn *websocket.Conn) {
-			wsConn := newWSConnection(conn)
+			wsConn := newWSConnection(conn, logger)
 			handler.OnConnect(wsConn)
 
-			go wsConn.readPump(handler)
+			// Use readPumpWithConfig with default configuration
+			go wsConn.readPumpWithConfig(handler, defaultWSConfig())
 			go wsConn.writePump()
 		})
 

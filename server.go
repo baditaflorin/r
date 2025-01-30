@@ -52,14 +52,52 @@ func NewServer(config Config) *serverImpl {
 
 func (s *serverImpl) buildHandler() fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
+		defer func() {
+			if r := recover(); r != nil {
+				stack := debug.Stack()
+				err := fmt.Errorf("panic recovered: %v\nStack: %s", r, stack)
+
+				// Log the error
+				if logger, ok := ctx.UserValue("logger").(Logger); ok {
+					logger.Error("Panic recovered in request handler",
+						"error", err,
+						"path", string(ctx.Path()),
+						"method", string(ctx.Method()),
+						"request_id", ctx.Response.Header.Peek("X-Request-ID"),
+					)
+				}
+
+				// Return 500 error to client
+				ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
+			}
+		}()
+
 		c := newRoutingContext(ctx)
 		reqCtx := newContextImpl(c)
 
+		// Ensure request ID
 		if reqCtx.RequestID() == "" {
 			reqCtx.requestID = uuid.New().String()
 		}
+		ctx.Response.Header.Set("X-Request-ID", reqCtx.requestID)
 
-		s.router.router.HandleRequest(ctx)
+		// Set reasonable timeout for the entire request
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), s.config.ReadTimeout)
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() {
+			s.router.router.HandleRequest(ctx)
+			close(done)
+		}()
+
+		select {
+		case <-timeoutCtx.Done():
+			ctx.Error("Request Timeout", fasthttp.StatusGatewayTimeout)
+			return
+		case <-done:
+			return
+		}
 	}
 }
 
