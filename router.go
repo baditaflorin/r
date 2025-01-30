@@ -252,6 +252,9 @@ func (r *RouterImpl) GetRoutes() []*Route {
 
 // Add method to update route metrics
 func (r *RouterImpl) updateRouteMetrics(method, path string, duration time.Duration, err error) {
+	if r.routeMetrics == nil {
+		return // Skip metrics collection if not configured
+	}
 
 	routeKey := method + path
 	r.routesMu.RLock()
