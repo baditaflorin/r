@@ -29,6 +29,8 @@ type MiddlewareProvider interface {
 type RateLimiter interface {
 	Allow(key string) bool
 	Reset(key string)
+	SetDistributedClient(client RedisClient)
+	GetQuota(key string) (remaining int, reset time.Time)
 }
 
 // SecurityProvider defines the interface for security header management
@@ -90,6 +92,8 @@ type defaultRateLimiter struct {
 	per         time.Duration
 	mu          sync.RWMutex
 	cleanupTick *time.Ticker
+	redisClient RedisClient
+	keyPrefix   string
 }
 
 func NewDefaultRateLimiter(reqs int, per time.Duration) RateLimiter {
@@ -121,6 +125,14 @@ func (rl *defaultRateLimiter) cleanup() {
 }
 
 func (rl *defaultRateLimiter) Allow(key string) bool {
+	if rl.redisClient != nil {
+		return rl.distributedAllow(key)
+	}
+	return rl.localAllow(key)
+}
+
+// Original implementation becomes localAllow
+func (rl *defaultRateLimiter) localAllow(key string) bool {
 	now := time.Now()
 	if _, exists := rl.tokens[key]; !exists {
 		rl.tokens[key] = rl.maxRate
@@ -141,6 +153,49 @@ func (rl *defaultRateLimiter) Allow(key string) bool {
 	rl.tokens[key]--
 	rl.lastReq[key] = now
 	return true
+}
+
+// Add distributed implementation
+func (rl *defaultRateLimiter) distributedAllow(key string) bool {
+	redisKey := fmt.Sprintf("%s:%s", rl.keyPrefix, key)
+
+	// Try to get current token count
+	count, err := rl.redisClient.IncrBy(redisKey, -1)
+	if err != nil {
+		// Fallback to local rate limiting on Redis errors
+		return rl.localAllow(key)
+	}
+
+	// Initialize if not exists
+	if count < 0 {
+		rl.redisClient.Set(redisKey,
+			fmt.Sprintf("%d", int(rl.maxRate)),
+			rl.per)
+		return true
+	}
+
+	return count >= 0
+}
+
+// Implement GetQuota method
+func (rl *defaultRateLimiter) GetQuota(key string) (remaining int, reset time.Time) {
+	if rl.redisClient != nil {
+		// Get distributed quota
+		redisKey := fmt.Sprintf("%s:%s", rl.keyPrefix, key)
+		countStr, err := rl.redisClient.Get(redisKey)
+		if err == nil {
+			count, _ := strconv.Atoi(countStr)
+			return count, time.Now().Add(rl.per)
+		}
+	}
+
+	// Get local quota
+	rl.mu.RLock()
+	tokens := rl.tokens[key]
+	lastReq := rl.lastReq[key]
+	rl.mu.RUnlock()
+
+	return int(tokens), lastReq.Add(rl.per)
 }
 
 func (rl *defaultRateLimiter) Reset(key string) {
@@ -357,4 +412,17 @@ func (m *standardMiddleware) Timeout(duration time.Duration) MiddlewareFunc {
 			return
 		}
 	}
+}
+
+type RedisClient interface {
+	Get(key string) (string, error)
+	Set(key string, value string, expiration time.Duration) error
+	IncrBy(key string, value int64) (int64, error)
+}
+
+func (rl *defaultRateLimiter) SetDistributedClient(client RedisClient) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.redisClient = client
+	rl.keyPrefix = "ratelimit" // Default prefix, could be made configurable
 }
