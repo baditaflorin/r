@@ -88,6 +88,13 @@ func (l *structuredLogger) Log(method string, status int, latency time.Duration,
 	entry := l.bufferPool.Get().(*LogEntry)
 	defer l.bufferPool.Put(entry)
 
+	// Obtain a map from the pool for Fields
+	fields := mapPool.Get().(map[string]interface{})
+	// Clone existing fields into the new map
+	for k, v := range l.getFields() {
+		fields[k] = v
+	}
+
 	*entry = LogEntry{
 		Level:   InfoLevel,
 		Time:    time.Now(),
@@ -96,10 +103,14 @@ func (l *structuredLogger) Log(method string, status int, latency time.Duration,
 		Latency: latency,
 		IP:      ip,
 		Path:    path,
-		Fields:  l.getFields(),
+		Fields:  fields,
 	}
 
 	l.writeEntry(entry)
+
+	// Return the fields map to the pool after usage
+	mapPool.Put(fields)
+	entry.Fields = nil
 }
 
 func (l *structuredLogger) Info(msg string, args ...interface{}) {
@@ -133,15 +144,26 @@ func (l *structuredLogger) Error(msg string, args ...interface{}) {
 	entry := l.bufferPool.Get().(*LogEntry)
 	defer l.bufferPool.Put(entry)
 
+	// Obtain a map from the pool for Fields
+	fields := mapPool.Get().(map[string]interface{})
+	// Clone existing fields into the new map
+	for k, v := range l.getFields() {
+		fields[k] = v
+	}
+
 	*entry = LogEntry{
 		Level:      ErrorLevel,
 		Message:    fmt.Sprintf(msg, args...),
 		Time:       time.Now(),
-		Fields:     l.getFields(),
+		Fields:     fields,
 		StackTrace: string(debug.Stack()),
 	}
 
 	l.writeEntry(entry)
+
+	// Return the fields map to the pool after usage
+	mapPool.Put(fields)
+	entry.Fields = nil
 }
 
 func (l *structuredLogger) Debug(msg string, args ...interface{}) {
@@ -152,28 +174,50 @@ func (l *structuredLogger) Debug(msg string, args ...interface{}) {
 	entry := l.bufferPool.Get().(*LogEntry)
 	defer l.bufferPool.Put(entry)
 
+	// Obtain a map from the pool for Fields
+	fields := mapPool.Get().(map[string]interface{})
+	// Clone existing fields into the new map
+	for k, v := range l.getFields() {
+		fields[k] = v
+	}
+
 	*entry = LogEntry{
 		Level:   DebugLevel,
 		Message: fmt.Sprintf(msg, args...),
 		Time:    time.Now(),
-		Fields:  l.getFields(),
+		Fields:  fields,
 	}
 
 	l.writeEntry(entry)
+
+	// Return the fields map to the pool after usage
+	mapPool.Put(fields)
+	entry.Fields = nil
 }
 
 func (l *structuredLogger) Warn(msg string, args ...interface{}) {
 	entry := l.bufferPool.Get().(*LogEntry)
 	defer l.bufferPool.Put(entry)
 
+	// Obtain a map from the pool for Fields
+	fields := mapPool.Get().(map[string]interface{})
+	// Clone existing fields into the new map
+	for k, v := range l.getFields() {
+		fields[k] = v
+	}
+
 	*entry = LogEntry{
 		Level:   WarnLevel,
 		Message: fmt.Sprintf(msg, args...),
 		Time:    time.Now(),
-		Fields:  l.getFields(),
+		Fields:  fields,
 	}
 
 	l.writeEntry(entry)
+
+	// Return the fields map to the pool after usage
+	mapPool.Put(fields)
+	entry.Fields = nil
 }
 
 func (l *structuredLogger) WithField(key string, value interface{}) Logger {
