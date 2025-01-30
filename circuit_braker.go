@@ -103,10 +103,25 @@ func NewCircuitBreaker(threshold int64, resetTimeout time.Duration, metrics Metr
 		stopMonitor:  make(chan struct{}),
 	}
 
-	// Start the monitoring goroutine
-	go cb.startStateMonitor()
+	// Start a single monitoring loop
+	go cb.monitorLoop()
 
 	return cb
+}
+
+// Run monitorState at a fixed interval instead of triggering multiple times
+func (cb *CircuitBreaker) monitorLoop() {
+	ticker := time.NewTicker(time.Second * 15) // Monitor every 15 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			cb.monitorState()
+		case <-cb.stopMonitor:
+			return
+		}
+	}
 }
 
 type CircuitBreakerStatus struct {
