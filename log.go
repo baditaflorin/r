@@ -81,9 +81,18 @@ func (l *structuredLogger) Info(msg string, args ...interface{}) {
 
 	*entry = LogEntry{
 		Level:   InfoLevel,
-		Message: fmt.Sprintf(msg, args...),
+		Message: msg, // Keep raw message
 		Time:    time.Now(),
 		Fields:  l.getFields(),
+	}
+
+	// Efficiently append structured log arguments
+	if len(args) > 0 {
+		for i := 0; i < len(args); i += 2 {
+			if i+1 < len(args) {
+				entry.Fields[fmt.Sprint(args[i])] = args[i+1]
+			}
+		}
 	}
 
 	l.writeEntry(entry)
