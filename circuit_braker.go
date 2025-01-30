@@ -24,19 +24,16 @@ const (
 )
 
 func (cb *CircuitBreaker) isOpen() bool {
-	currentState := cb.state.Load()
+	currentState := cb.getState()
 	if currentState == stateOpen {
 		lastFailure := time.Unix(0, cb.lastFailure.Load())
 		if time.Since(lastFailure) > cb.resetTimeout {
-			// Try transitioning to half-open state
 			if cb.state.CompareAndSwap(stateOpen, stateHalfOpen) {
 				cb.successes.Store(0)
 				if cb.metrics != nil {
 					cb.metrics.IncrementCounter("circuit_breaker.state_change",
 						map[string]string{"from": "open", "to": "half-open"})
 				}
-				// Trigger immediate state monitoring on transition
-				cb.monitorState()
 			}
 			return false
 		}
@@ -44,16 +41,13 @@ func (cb *CircuitBreaker) isOpen() bool {
 	}
 
 	if currentState == stateHalfOpen {
-		currentSuccesses := cb.successes.Load()
-		if currentSuccesses >= cb.halfOpenMax {
+		if cb.successes.Load() >= cb.halfOpenMax {
 			if cb.state.CompareAndSwap(stateHalfOpen, stateClosed) {
 				cb.failures.Store(0)
 				if cb.metrics != nil {
 					cb.metrics.IncrementCounter("circuit_breaker.state_change",
 						map[string]string{"from": "half-open", "to": "closed"})
 				}
-				// Trigger immediate state monitoring on transition
-				cb.monitorState()
 			}
 		}
 		return false
@@ -62,6 +56,15 @@ func (cb *CircuitBreaker) isOpen() bool {
 	return false
 }
 
+// Atomic getter for state
+func (cb *CircuitBreaker) getState() int32 {
+	return cb.state.Load()
+}
+
+// Atomic setter for state
+func (cb *CircuitBreaker) setState(newState int32) {
+	cb.state.Store(newState)
+}
 func (cb *CircuitBreaker) recordFailure() {
 	failures := cb.failures.Add(1)
 	cb.lastFailure.Store(time.Now().UnixNano())
