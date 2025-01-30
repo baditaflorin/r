@@ -86,26 +86,28 @@ func (c *contextImpl) AddSpan(name string, metadata map[string]string) {
 	c.spans = append(c.spans, span)
 }
 
+var contextPool = sync.Pool{
+	New: func() interface{} {
+		return &contextImpl{}
+	},
+}
+
 func newContextImpl(c *routing.Context) *contextImpl {
-	// Create cancellable context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
-	impl := &contextImpl{
-		Context:    c,
-		ctx:        ctx,
-		cancel:     cancel,
-		requestID:  uuid.New().String(),
-		store:      &sync.Map{},
-		handlers:   make([]HandlerFunc, 0),
-		startTime:  time.Now(),
-		spans:      make([]*tracingSpan, 0),
-		timeouts:   make(map[string]time.Duration),
-		done:       make(chan struct{}),
-		errorStack: make([]string, 0),
-		traceID:    uuid.New().String(), // Generate unique trace ID
-	}
-
-	// Start root span
+	impl := contextPool.Get().(*contextImpl)
+	impl.Context = c
+	impl.ctx = ctx
+	impl.cancel = cancel
+	impl.requestID = uuid.New().String()
+	impl.store = &sync.Map{}
+	impl.handlers = nil
+	impl.startTime = time.Now()
+	impl.spans = nil
+	impl.timeouts = make(map[string]time.Duration)
+	impl.done = make(chan struct{})
+	impl.errorStack = nil
+	impl.traceID = uuid.New().String()
 	impl.rootSpan = impl.startSpan("request", map[string]string{
 		"request_id": impl.requestID,
 		"method":     impl.Method(),
@@ -114,10 +116,11 @@ func newContextImpl(c *routing.Context) *contextImpl {
 		"trace_id":   impl.traceID,
 	})
 
-	// Setup cleanup on context done
+	// Ensure cleanup on context done
 	go func() {
 		<-ctx.Done()
 		impl.cleanup()
+		contextPool.Put(impl) // Return to pool for reuse
 	}()
 
 	return impl
