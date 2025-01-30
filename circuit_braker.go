@@ -173,20 +173,34 @@ func (cb *CircuitBreaker) monitorState() {
 	}
 
 	status := cb.GetStatus()
-	cb.metrics.RecordValue("circuit_breaker.error_rate", status.ErrorPercentage, nil)
-	cb.metrics.RecordValue("circuit_breaker.total_requests", float64(status.TotalRequests), nil)
-	cb.metrics.RecordValue("circuit_breaker.failures", float64(status.Failures), nil)
 
-	stateMetric := 0.0
-	switch status.State {
-	case "OPEN":
-		stateMetric = 2.0
-	case "HALF-OPEN":
-		stateMetric = 1.0
-	case "CLOSED":
-		stateMetric = 0.0
+	// Create a timeout context to prevent monitoring from hanging
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cb.metrics.RecordValue("circuit_breaker.error_rate", status.ErrorPercentage, nil)
+		cb.metrics.RecordValue("circuit_breaker.total_requests", float64(status.TotalRequests), nil)
+		cb.metrics.RecordValue("circuit_breaker.failures", float64(status.Failures), nil)
+
+		stateMetric := 0.0
+		switch status.State {
+		case "OPEN":
+			stateMetric = 2.0
+		case "HALF-OPEN":
+			stateMetric = 1.0
+		case "CLOSED":
+			stateMetric = 0.0
+		}
+		cb.metrics.RecordValue("circuit_breaker.state", stateMetric, nil)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond): // Prevent blocking
+		if cb.metrics != nil {
+			cb.metrics.IncrementCounter("circuit_breaker.monitor_timeout", nil)
+		}
 	}
-	cb.metrics.RecordValue("circuit_breaker.state", stateMetric, nil)
 }
 
 func (cb *CircuitBreaker) startStateMonitor() {
