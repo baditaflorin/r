@@ -25,7 +25,9 @@ const (
 
 func (cb *CircuitBreaker) isOpen() bool {
 	currentState := cb.getState()
-	if currentState == stateOpen {
+
+	switch currentState {
+	case stateOpen:
 		lastFailure := time.Unix(0, cb.lastFailure.Load())
 		if time.Since(lastFailure) > cb.resetTimeout {
 			if cb.state.CompareAndSwap(stateOpen, stateHalfOpen) {
@@ -38,9 +40,8 @@ func (cb *CircuitBreaker) isOpen() bool {
 			return false
 		}
 		return true
-	}
 
-	if currentState == stateHalfOpen {
+	case stateHalfOpen:
 		if cb.successes.Load() >= cb.halfOpenMax {
 			if cb.state.CompareAndSwap(stateHalfOpen, stateClosed) {
 				cb.failures.Store(0)
@@ -51,9 +52,10 @@ func (cb *CircuitBreaker) isOpen() bool {
 			}
 		}
 		return false
-	}
 
-	return false
+	default:
+		return false
+	}
 }
 
 // Atomic getter for state
@@ -66,11 +68,20 @@ func (cb *CircuitBreaker) setState(newState int32) {
 	cb.state.Store(newState)
 }
 
+const maxBackoff = 5 * time.Minute // Maximum backoff duration
+
 func (cb *CircuitBreaker) recordFailure() {
 	failures := cb.failures.Add(1)
 
-	// Correct way to store last failure time atomically
+	// Store last failure timestamp atomically
 	cb.lastFailure.Store(time.Now().UnixNano())
+
+	// Exponential backoff mechanism
+	newTimeout := cb.resetTimeout * 2
+	if newTimeout > maxBackoff {
+		newTimeout = maxBackoff
+	}
+	cb.resetTimeout = newTimeout
 
 	if cb.metrics != nil {
 		cb.metrics.IncrementCounter("circuit_breaker.failure", nil)
@@ -123,6 +134,7 @@ func (cb *CircuitBreaker) monitorLoop() {
 		case <-ticker.C:
 			cb.monitorState()
 		case <-cb.stopMonitor:
+			close(cb.stopMonitor) // Ensure the channel is properly closed
 			return
 		}
 	}
