@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"math"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -434,24 +435,6 @@ func (m *standardMiddleware) RequestID() MiddlewareFunc {
 	}
 }
 
-func (m *standardMiddleware) Recovery(handler func(Context, interface{})) MiddlewareFunc {
-	return func(c Context) {
-		defer func() {
-			if rcv := recover(); rcv != nil {
-				if h := m.router.panicHandler; h != nil {
-					h(c, rcv)
-				} else if handler != nil {
-					handler(c, rcv)
-				} else {
-					c.AbortWithError(http.StatusInternalServerError,
-						fmt.Errorf("panic recovered: %v", rcv))
-				}
-			}
-		}()
-		c.Next()
-	}
-}
-
 // WithLogger sets a custom logger implementation
 func WithLogger(l Logger) MiddlewareOption {
 	return func(m *standardMiddleware) {
@@ -756,4 +739,89 @@ func WithResetTimeout(timeout time.Duration) CircuitBreakerOption {
 	return func(c *CircuitBreakerConfig) {
 		c.ResetTimeout = timeout
 	}
+}
+
+func (m *standardMiddleware) Recovery(handler func(Context, interface{})) MiddlewareFunc {
+	return func(c Context) {
+		defer func() {
+			if rcv := recover(); rcv != nil {
+				// Capture stack trace
+				stack := debug.Stack()
+
+				// Create error context
+				errCtx := &ErrorContext{
+					Error:     fmt.Errorf("%v", rcv),
+					Stack:     string(stack),
+					RequestID: c.RequestID(),
+					Timestamp: time.Now(),
+					Path:      c.Path(),
+					Method:    c.Method(),
+					ClientIP:  c.RealIP(),
+					UserAgent: c.GetHeader("User-Agent"),
+				}
+
+				// Record error metrics
+				if m.metrics != nil {
+					m.metrics.IncrementCounter("panic_recovery",
+						map[string]string{
+							"path":   c.Path(),
+							"method": c.Method(),
+						})
+				}
+
+				// Log the error with full context
+				if m.logger != nil {
+					m.logger.Error("Panic recovered in request handler",
+						"error", errCtx.Error,
+						"stack", errCtx.Stack,
+						"request_id", errCtx.RequestID,
+						"path", errCtx.Path,
+						"method", errCtx.Method,
+						"client_ip", errCtx.ClientIP,
+						"user_agent", errCtx.UserAgent)
+				}
+
+				// If custom handler provided, use it
+				if handler != nil {
+					handler(c, rcv)
+					return
+				}
+
+				// Default error response
+				status := http.StatusInternalServerError
+				response := map[string]interface{}{
+					"error":      "Internal Server Error",
+					"request_id": errCtx.RequestID,
+					"timestamp":  errCtx.Timestamp.Format(time.RFC3339),
+				}
+
+				// In development, include more details
+				if m.isDevelopment() {
+					response["debug"] = map[string]interface{}{
+						"error": errCtx.Error.Error(),
+						"stack": errCtx.Stack,
+					}
+				}
+
+				c.JSON(status, response)
+			}
+		}()
+
+		c.Next()
+	}
+}
+
+type ErrorContext struct {
+	Error     error
+	Stack     string
+	RequestID string
+	Timestamp time.Time
+	Path      string
+	Method    string
+	ClientIP  string
+	UserAgent string
+}
+
+func (m *standardMiddleware) isDevelopment() bool {
+	return os.Getenv("APP_ENV") == "development"
 }
