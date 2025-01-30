@@ -30,9 +30,11 @@ type serverImpl struct {
 	wg       sync.WaitGroup
 	mu       sync.Mutex
 
-	healthChecks    []HealthCheck
-	activeConns     sync.Map
-	shutdownTimeout time.Duration
+	healthChecks     []HealthCheck
+	activeConns      sync.Map
+	shutdownTimeout  time.Duration
+	metricsCollector MetricsCollector
+	logger           Logger
 }
 
 type HealthCheck struct {
@@ -46,15 +48,25 @@ func NewServer(config Config) *serverImpl {
 		config.Handler = NewRouter()
 	}
 
+	// Create default logger if not provided
+	logger := NewDefaultLogger()
+
 	s := &serverImpl{
-		router:   config.Handler.(*RouterImpl),
-		config:   config,
-		shutdown: make(chan struct{}),
+		router:           config.Handler.(*RouterImpl),
+		config:           config,
+		shutdown:         make(chan struct{}),
+		shutdownTimeout:  30 * time.Second, // Default shutdown timeout
+		metricsCollector: NewDefaultMetricsCollector(),
+		logger:           logger,
 	}
 
 	// Set up default panic handler
 	s.router.PanicHandler(func(c Context, rcv interface{}) {
 		err := fmt.Errorf("panic: %v\n%s", rcv, debug.Stack())
+		s.logger.Error("Panic in request handler",
+			"error", err,
+			"stack", debug.Stack(),
+		)
 		c.AbortWithError(http.StatusInternalServerError, err)
 	})
 
@@ -128,33 +140,96 @@ func (s *serverImpl) Start(address string) error {
 }
 
 func (s *serverImpl) Stop() error {
+	// Create context with server's shutdown timeout
 	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 	defer cancel()
 
-	// Signal shutdown
+	// Signal shutdown to all components
 	close(s.shutdown)
 
-	// Stop accepting new connections
-	if err := s.server.Shutdown(); err != nil {
-		return fmt.Errorf("shutdown error: %w", err)
-	}
+	// Create wait group for tracking all cleanup tasks
+	var wg sync.WaitGroup
 
-	// Wait for active connections to complete
-	done := make(chan struct{})
+	// Track cleanup tasks
+	errChan := make(chan error, 3) // Buffer for potential errors
+
+	// Shutdown HTTP server
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+		if err := s.server.ShutdownWithContext(ctx); err != nil {
+			errChan <- fmt.Errorf("HTTP server shutdown error: %w", err)
+		}
+	}()
+
+	// Cleanup active connections
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Set deadline for existing connections
+		deadline := time.Now().Add(30 * time.Second)
 		s.activeConns.Range(func(key, value interface{}) bool {
-			conn := value.(net.Conn)
-			conn.Close()
+			if conn, ok := value.(net.Conn); ok {
+				conn.SetDeadline(deadline)
+			}
 			return true
 		})
-		s.wg.Wait()
+	}()
+
+	// Cleanup resources and flush logs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Close any resource pools
+		if s.metricsCollector != nil {
+			if err := s.metricsCollector.Close(); err != nil {
+				errChan <- fmt.Errorf("metrics collector shutdown error: %w", err)
+			}
+		}
+
+		// Flush logs - ensure logger supports Sync()
+		if syncer, ok := s.logger.(interface{ Sync() error }); ok {
+			if err := syncer.Sync(); err != nil {
+				errChan <- fmt.Errorf("logger sync error: %w", err)
+			}
+		}
+	}()
+
+	// Wait for cleanup with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
 		close(done)
 	}()
 
+	// Wait for either completion or timeout
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("shutdown timeout exceeded: %w", ctx.Err())
 	case <-done:
+		// Check for any errors
+		close(errChan)
+		var errors []error
+		for err := range errChan {
+			errors = append(errors, err)
+		}
+		if len(errors) > 0 {
+			return fmt.Errorf("shutdown completed with errors: %v", errors)
+		}
 		return nil
 	}
+}
+
+func (s *serverImpl) WithLogger(logger Logger) *serverImpl {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logger = logger
+	return s
+}
+
+func (s *serverImpl) WithMetricsCollector(collector MetricsCollector) *serverImpl {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.metricsCollector = collector
+	return s
 }
