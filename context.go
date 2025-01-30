@@ -4,7 +4,9 @@ package r
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -54,10 +56,13 @@ type contextImpl struct {
 	router     *RouterImpl
 
 	// Add tracing and timing
-	startTime time.Time
-	spans     []*tracingSpan
-	timeouts  map[string]time.Duration
-	metrics   MetricsCollector
+	startTime  time.Time
+	spans      []*tracingSpan
+	timeouts   map[string]time.Duration
+	metrics    MetricsCollector
+	errorCause error         // Add field to track root cause
+	errorStack []string      // Add error stack trace
+	done       chan struct{} // Add for cancellation support
 }
 
 type tracingSpan struct {
@@ -152,9 +157,20 @@ func (c *contextImpl) Abort() {
 }
 
 func (c *contextImpl) AbortWithError(code int, err error) {
-	c.err = err
+	c.errorCause = err
+	c.errorStack = append(c.errorStack, fmt.Sprintf("%v", err))
+	if stackTrace := debug.Stack(); len(stackTrace) > 0 {
+		c.errorStack = append(c.errorStack, string(stackTrace))
+	}
 	c.Response.SetStatusCode(code)
 	c.Abort()
+
+	// Trigger cancellation
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
 }
 
 func (c *contextImpl) Error() error {
