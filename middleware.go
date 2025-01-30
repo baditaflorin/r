@@ -98,6 +98,7 @@ type defaultRateLimiter struct {
 	keyPrefix   string
 	logger      Logger
 	metrics     MetricsCollector
+	buckets     map[string]*tokenBucket // Add this field
 }
 
 // Update constructor to include new fields
@@ -110,6 +111,7 @@ func NewDefaultRateLimiter(reqs int, per time.Duration, opts ...RateLimiterOptio
 		cleanupTick: time.NewTicker(time.Minute * 5),
 		keyPrefix:   "ratelimit",
 		logger:      NewDefaultLogger(),
+		buckets:     make(map[string]*tokenBucket), // Initialize buckets map
 	}
 
 	// Apply options
@@ -134,10 +136,13 @@ func (rl *defaultRateLimiter) cleanup() {
 	for range rl.cleanupTick.C {
 		rl.mu.Lock()
 		now := time.Now()
-		for ip, lastSeen := range rl.lastReq {
-			if now.Sub(lastSeen) > rl.per*2 {
-				delete(rl.tokens, ip)
-				delete(rl.lastReq, ip)
+		for key, bucket := range rl.buckets {
+			if now.Sub(bucket.lastRefill) > rl.per*2 {
+				delete(rl.buckets, key)
+				if rl.metrics != nil {
+					rl.metrics.IncrementCounter("rate_limiter.bucket_cleaned",
+						map[string]string{"key": key})
+				}
 			}
 		}
 		rl.mu.Unlock()
@@ -148,7 +153,56 @@ func (rl *defaultRateLimiter) Allow(key string) bool {
 	if rl.redisClient != nil {
 		return rl.distributedAllow(key)
 	}
-	return rl.localAllow(key)
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+
+	bucket, exists := rl.buckets[key]
+	if !exists {
+		// Initialize new bucket
+		bucket = &tokenBucket{
+			tokens:     rl.maxRate,
+			lastRefill: now,
+		}
+		rl.buckets[key] = bucket
+	}
+
+	// Calculate token refill
+	elapsed := now.Sub(bucket.lastRefill).Seconds()
+	refill := elapsed * (rl.maxRate / rl.per.Seconds())
+
+	bucket.tokens = math.Min(rl.maxRate, bucket.tokens+refill)
+	bucket.lastRefill = now
+
+	// Check if we have enough tokens
+	if bucket.tokens < 1 {
+		if rl.metrics != nil {
+			rl.metrics.IncrementCounter("rate_limiter.rejected",
+				map[string]string{
+					"key":    key,
+					"reason": "no_tokens",
+				})
+		}
+		return false
+	}
+
+	// Consume token
+	bucket.tokens--
+
+	if rl.metrics != nil {
+		rl.metrics.RecordValue("rate_limiter.tokens_remaining",
+			bucket.tokens,
+			map[string]string{"key": key})
+	}
+
+	return true
+}
+
+type tokenBucket struct {
+	tokens     float64
+	lastRefill time.Time
 }
 
 // Original implementation becomes localAllow
@@ -233,42 +287,55 @@ func (rl *defaultRateLimiter) distributedAllow(key string) bool {
 }
 
 func (rl *defaultRateLimiter) GetQuota(key string) (remaining int, reset time.Time) {
-	if rl.redisClient != nil {
-		redisKey := fmt.Sprintf("%s:%s", rl.keyPrefix, key)
-
-		now := time.Now()
-		windowStart := now.Add(-rl.per).UnixNano()
-
-		count, err := rl.redisClient.ZCount(redisKey,
-			strconv.FormatInt(windowStart, 10),
-			"+inf")
-
-		if err == nil {
-			// Properly convert between float64 and int
-			remaining = int(math.Max(0, rl.maxRate-float64(count)))
-			return remaining, now.Add(rl.per)
-		}
-
-		rl.logger.Error("Failed to get quota from Redis",
-			"error", err,
-			"key", key)
-	}
-
-	// Fallback to local quota
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
 
-	tokens := rl.tokens[key]
-	lastReq := rl.lastReq[key]
+	bucket, exists := rl.buckets[key]
+	if !exists {
+		return int(rl.maxRate), time.Now()
+	}
 
-	remaining = int(math.Max(0, tokens))
+	// Calculate current tokens
+	now := time.Now()
+	elapsed := now.Sub(bucket.lastRefill).Seconds()
+	currentTokens := math.Min(rl.maxRate,
+		bucket.tokens+(elapsed*(rl.maxRate/rl.per.Seconds())))
 
-	return remaining, lastReq.Add(rl.per)
+	// Calculate time until bucket is full
+	timeToFull := time.Duration(
+		((rl.maxRate - currentTokens) / (rl.maxRate / rl.per.Seconds())) *
+			float64(time.Second))
+
+	return int(currentTokens), now.Add(timeToFull)
 }
-
 func (rl *defaultRateLimiter) Reset(key string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	// Clean up the bucket
+	delete(rl.buckets, key)
+
+	// Clean up legacy maps for backward compatibility
 	delete(rl.tokens, key)
 	delete(rl.lastReq, key)
+
+	// If using Redis, clean up distributed state
+	if rl.redisClient != nil {
+		redisKey := fmt.Sprintf("%s:%s", rl.keyPrefix, key)
+		if err := rl.redisClient.Set(redisKey, "", 0); err != nil {
+			rl.logger.Error("Failed to reset Redis key",
+				"error", err,
+				"key", key)
+		}
+	}
+
+	if rl.metrics != nil {
+		rl.metrics.IncrementCounter("rate_limiter.reset",
+			map[string]string{
+				"key":    key,
+				"source": "api_call",
+			})
+	}
 }
 
 // Middleware implementations
