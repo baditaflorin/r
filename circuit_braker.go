@@ -65,8 +65,11 @@ func (cb *CircuitBreaker) getState() int32 {
 func (cb *CircuitBreaker) setState(newState int32) {
 	cb.state.Store(newState)
 }
+
 func (cb *CircuitBreaker) recordFailure() {
 	failures := cb.failures.Add(1)
+
+	// Correct way to store last failure time atomically
 	cb.lastFailure.Store(time.Now().UnixNano())
 
 	if cb.metrics != nil {
@@ -80,8 +83,6 @@ func (cb *CircuitBreaker) recordFailure() {
 				cb.metrics.IncrementCounter("circuit_breaker.state_change",
 					map[string]string{"to": "open"})
 			}
-			// Trigger immediate state monitoring on transition
-			cb.monitorState()
 		}
 	}
 }
@@ -204,6 +205,6 @@ func (cb *CircuitBreaker) startStateMonitor() {
 
 func (cb *CircuitBreaker) Close() error {
 	close(cb.stopMonitor)
-	time.Sleep(50 * time.Millisecond)
+	<-time.After(100 * time.Millisecond) // Allow time for the goroutine to exit
 	return nil
 }
