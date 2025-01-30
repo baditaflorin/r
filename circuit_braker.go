@@ -15,26 +15,26 @@ type CircuitBreaker struct {
 	metrics      MetricsCollector
 	state        atomic.Int32
 	stopMonitor  chan struct{} // New field for stopping the monitor
-	doneMonitor  chan struct{} // NEW channel for signaling when monitorLoop is done
+	doneMonitor  chan struct{} // NEW channel for signaling when MonitorLoop is done
 
 }
 
 const (
-	stateOpen = iota
-	stateHalfOpen
-	stateClosed
+	StateOpen = iota
+	StateHalfOpen
+	StateClosed
 )
 
-func (cb *CircuitBreaker) isOpen() bool {
+func (cb *CircuitBreaker) IsOpen() bool {
 	currentState := cb.state.Load() // Load state only once
 
 	switch currentState {
-	case stateOpen:
+	case StateOpen:
 		lastFailureTime := cb.lastFailure.Load() // Load lastFailure once
 		lastFailure := time.Unix(0, lastFailureTime)
 
 		if time.Since(lastFailure) > cb.resetTimeout {
-			if cb.state.CompareAndSwap(stateOpen, stateHalfOpen) {
+			if cb.state.CompareAndSwap(StateOpen, StateHalfOpen) {
 				cb.successes.Store(0)
 				if cb.metrics != nil {
 					cb.metrics.IncrementCounter("circuit_breaker.state_change",
@@ -45,9 +45,9 @@ func (cb *CircuitBreaker) isOpen() bool {
 		}
 		return true
 
-	case stateHalfOpen:
+	case StateHalfOpen:
 		if cb.successes.Load() >= cb.halfOpenMax {
-			if cb.state.CompareAndSwap(stateHalfOpen, stateClosed) {
+			if cb.state.CompareAndSwap(StateHalfOpen, StateClosed) {
 				cb.failures.Store(0)
 				if cb.metrics != nil {
 					cb.metrics.IncrementCounter("circuit_breaker.state_change",
@@ -63,40 +63,39 @@ func (cb *CircuitBreaker) isOpen() bool {
 }
 
 // Atomic getter for state
-func (cb *CircuitBreaker) getState() int32 {
+func (cb *CircuitBreaker) GetState() int32 {
 	return cb.state.Load()
 }
 
 // Atomic setter for state
-func (cb *CircuitBreaker) setState(newState int32) {
+func (cb *CircuitBreaker) SetState(newState int32) {
 	cb.state.Store(newState)
 }
 
 const maxBackoff = 5 * time.Minute // Maximum backoff duration
 
-func (cb *CircuitBreaker) recordFailure() {
+func (cb *CircuitBreaker) RecordFailure() {
 	failures := cb.failures.Add(1)
 
 	// Store last failure timestamp atomically
 	cb.lastFailure.Store(time.Now().UnixNano())
 
-	// Exponential backoff mechanism (fixed)
-	currentTimeout := cb.resetTimeout
+	// Convert atomic value properly
+	currentTimeout := time.Duration(atomic.LoadInt64((*int64)(&cb.resetTimeout)))
 	newTimeout := currentTimeout * 2
 	if newTimeout > maxBackoff {
 		newTimeout = maxBackoff
 	}
 
-	// Fix: Explicitly cast time.Duration to int64
-	atomic.CompareAndSwapInt64((*int64)(&cb.resetTimeout), int64(currentTimeout), int64(newTimeout))
+	atomic.StoreInt64((*int64)(&cb.resetTimeout), int64(newTimeout))
 
 	if cb.metrics != nil {
 		cb.metrics.IncrementCounter("circuit_breaker.failure", nil)
 	}
 
 	if failures >= cb.threshold {
-		if cb.state.CompareAndSwap(stateClosed, stateOpen) ||
-			cb.state.CompareAndSwap(stateHalfOpen, stateOpen) {
+		if cb.state.CompareAndSwap(StateClosed, StateOpen) ||
+			cb.state.CompareAndSwap(StateHalfOpen, StateOpen) {
 			if cb.metrics != nil {
 				cb.metrics.IncrementCounter("circuit_breaker.state_change",
 					map[string]string{"to": "open"})
@@ -105,9 +104,20 @@ func (cb *CircuitBreaker) recordFailure() {
 	}
 }
 
-func (cb *CircuitBreaker) recordSuccess() {
-	if cb.state.Load() == stateHalfOpen {
-		cb.successes.Add(1)
+func (cb *CircuitBreaker) RecordSuccess() {
+	if cb.state.Load() == StateHalfOpen {
+		successes := cb.successes.Add(1)
+		if successes >= cb.halfOpenMax {
+			if cb.state.CompareAndSwap(StateHalfOpen, StateClosed) {
+				cb.failures.Store(0)
+				if cb.metrics != nil {
+					cb.metrics.IncrementCounter("circuit_breaker.state_change",
+						map[string]string{"from": "half-open", "to": "closed"})
+				}
+			}
+		}
+	} else {
+		cb.successes.Store(0) // Reset success streak
 	}
 
 	if cb.metrics != nil {
@@ -128,13 +138,13 @@ func NewCircuitBreaker(threshold int64, resetTimeout time.Duration, metrics Metr
 	}
 
 	// Start a single monitoring loop
-	go cb.monitorLoop()
+	go cb.MonitorLoop()
 
 	return cb
 }
 
-// Run monitorState at a fixed interval instead of triggering multiple times
-func (cb *CircuitBreaker) monitorLoop() {
+// Run MonitorState at a fixed interval instead of triggering multiple times
+func (cb *CircuitBreaker) MonitorLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer func() {
 		ticker.Stop()
@@ -144,7 +154,7 @@ func (cb *CircuitBreaker) monitorLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			cb.monitorState()
+			cb.MonitorState()
 		case <-cb.stopMonitor:
 			return
 		}
@@ -164,11 +174,11 @@ func (cb *CircuitBreaker) GetStatus() CircuitBreakerStatus {
 	currentState := cb.state.Load()
 	var stateName string
 	switch currentState {
-	case stateOpen:
+	case StateOpen:
 		stateName = "OPEN"
-	case stateHalfOpen:
+	case StateHalfOpen:
 		stateName = "HALF-OPEN"
-	case stateClosed:
+	case StateClosed:
 		stateName = "CLOSED"
 	}
 
@@ -190,7 +200,7 @@ func (cb *CircuitBreaker) GetStatus() CircuitBreakerStatus {
 	}
 }
 
-func (cb *CircuitBreaker) monitorState() {
+func (cb *CircuitBreaker) MonitorState() {
 	if cb.metrics == nil {
 		return
 	}
@@ -215,10 +225,10 @@ func (cb *CircuitBreaker) monitorState() {
 }
 
 func (cb *CircuitBreaker) Close() error {
-	// Signal the monitorLoop to stop
+	// Signal the MonitorLoop to stop
 	close(cb.stopMonitor)
 
-	// Wait for monitorLoop to signal it's fully done
+	// Wait for MonitorLoop to signal it's fully done
 	<-cb.doneMonitor
 	return nil
 }

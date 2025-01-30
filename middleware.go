@@ -599,7 +599,7 @@ func (m *standardMiddleware) CircuitBreaker(opts ...CircuitBreakerOption) Middle
 		circuitBreaker := cbValue.(*CircuitBreaker)
 
 		// Check if circuit is open
-		if circuitBreaker.isOpen() {
+		if circuitBreaker.IsOpen() {
 			if m.metrics != nil {
 				m.metrics.IncrementCounter("circuit_breaker.rejected",
 					map[string]string{
@@ -656,7 +656,7 @@ func (m *standardMiddleware) CircuitBreaker(opts ...CircuitBreakerOption) Middle
 		duration := time.Since(start)
 
 		if handlerError != nil || duration > config.Timeout {
-			circuitBreaker.recordFailure()
+			circuitBreaker.RecordFailure()
 
 			if m.metrics != nil {
 				tags := map[string]string{
@@ -688,9 +688,9 @@ func (m *standardMiddleware) CircuitBreaker(opts ...CircuitBreakerOption) Middle
 			}
 
 			// Trigger immediate state monitoring on failure
-			circuitBreaker.monitorState()
+			circuitBreaker.MonitorState()
 		} else {
-			circuitBreaker.recordSuccess()
+			circuitBreaker.RecordSuccess()
 
 			if m.metrics != nil {
 				tags := map[string]string{
