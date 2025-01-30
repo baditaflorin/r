@@ -426,3 +426,29 @@ func (rl *defaultRateLimiter) SetDistributedClient(client RedisClient) {
 	rl.redisClient = client
 	rl.keyPrefix = "ratelimit" // Default prefix, could be made configurable
 }
+
+func (m *standardMiddleware) CircuitBreaker(threshold int64, resetTimeout time.Duration) MiddlewareFunc {
+	cb := &CircuitBreaker{
+		threshold:    threshold,
+		resetTimeout: resetTimeout,
+	}
+
+	return func(c Context) {
+		if cb.isOpen() {
+			c.AbortWithError(http.StatusServiceUnavailable,
+				fmt.Errorf("circuit breaker open"))
+			return
+		}
+
+		start := time.Now()
+		c.Next()
+
+		if c.Error() != nil {
+			cb.recordFailure()
+		}
+
+		if time.Since(start) > 5*time.Second {
+			cb.recordFailure() // Consider slow responses as failures
+		}
+	}
+}

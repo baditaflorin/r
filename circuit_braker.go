@@ -1,8 +1,6 @@
 package r
 
 import (
-	"fmt"
-	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,32 +12,6 @@ type CircuitBreaker struct {
 	threshold    int64
 	resetTimeout time.Duration
 	mu           sync.RWMutex
-}
-
-func (m *standardMiddleware) CircuitBreaker(threshold int64, resetTimeout time.Duration) MiddlewareFunc {
-	cb := &CircuitBreaker{
-		threshold:    threshold,
-		resetTimeout: resetTimeout,
-	}
-
-	return func(c Context) {
-		if cb.isOpen() {
-			c.AbortWithError(http.StatusServiceUnavailable,
-				fmt.Errorf("circuit breaker open"))
-			return
-		}
-
-		start := time.Now()
-		c.Next()
-
-		if c.Error() != nil {
-			cb.recordFailure()
-		}
-
-		if time.Since(start) > 5*time.Second {
-			cb.recordFailure() // Consider slow responses as failures
-		}
-	}
 }
 
 func (cb *CircuitBreaker) isOpen() bool {
