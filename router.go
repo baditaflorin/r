@@ -27,15 +27,18 @@ type Router interface {
 	NotFound(handler HandlerFunc)
 	MethodNotAllowed(handler HandlerFunc)
 	PanicHandler(handler PanicHandlerFunc)
+	ServeHTTP(ctx *fasthttp.RequestCtx)
 }
 
 type PanicHandlerFunc func(Context, interface{})
 
 // RouterImpl implements the Router interface using fasthttp-routing
 type RouterImpl struct {
-	router                  *routing.Router
-	group                   *routing.RouteGroup
-	upgrader                websocket.FastHTTPUpgrader
+	router     *routing.Router
+	group      *routing.RouteGroup
+	upgrader   websocket.FastHTTPUpgrader
+	middleware []HandlerFunc // Add this field to store middleware
+
 	panicHandler            PanicHandlerFunc
 	methodNotAllowedHandler HandlerFunc
 	middlewareProvider      MiddlewareProvider
@@ -79,18 +82,17 @@ type RouteValidator interface {
 // NewRouter creates a new Router instance
 func NewRouter() Router {
 	r := &RouterImpl{
-		router: routing.New(),
+		router:     routing.New(),
+		middleware: make([]HandlerFunc, 0),
+		routes:     make(map[string]*Route),
 		upgrader: websocket.FastHTTPUpgrader{
 			EnableCompression: true,
 			CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
 				return true
 			},
 		},
-		routes:       make(map[string]*Route),
-		routeMetrics: NewDefaultMetricsCollector(), // Now this will work
 	}
 	r.group = r.router.Group("")
-	r.middlewareProvider = NewMiddlewareProvider(r)
 	return r
 }
 
@@ -164,38 +166,29 @@ func (r *RouterImpl) wrapHandlers(handlers ...HandlerFunc) []routing.Handler {
 	wrapped := make([]routing.Handler, len(handlers))
 
 	for i, h := range handlers {
-		// Capture h in a local variable to avoid closure pitfalls
 		handler := h
-
 		wrapped[i] = func(c *routing.Context) error {
-			// Get contextImpl from sync.Pool
-			ctx := contextPool.Get().(*ContextImpl)
-			ctx.Context = c
-			ctx.router = r
-			ctx.handlers = []HandlerFunc{handler}
+			ctx := newContextImpl(c)
+
+			allHandlers := make([]HandlerFunc, 0, len(r.middleware)+1)
+			allHandlers = append(allHandlers, r.middleware...)
+			allHandlers = append(allHandlers, handler)
+
+			ctx.handlers = allHandlers
 			ctx.handlerIdx = -1
 
-			var err error
-			start := time.Now()
-			defer func() {
-				// Return contextImpl to the pool
-				contextPool.Put(ctx)
-				// Metrics update (already present in your code)
-				duration := time.Since(start)
-				r.updateRouteMetrics(
-					string(c.Method()),
-					string(c.Path()),
-					duration,
-					err,
-				)
-			}()
-
-			// Process the handlers
+			// Execute chain
 			ctx.Next()
 
-			// Check for any error in the context
-			err = ctx.Error()
-			return err
+			// Get status code
+			statusCode := ctx.RequestCtx().Response.StatusCode()
+			if statusCode > 0 {
+				// Ensure routing context has same status
+				c.SetStatusCode(statusCode)
+			}
+
+			// Return error if we have one
+			return ctx.Error()
 		}
 	}
 	return wrapped
@@ -298,5 +291,66 @@ func (r *RouterImpl) initializeIfNeeded() {
 	if r.routeMetrics == nil && r.router != nil {
 		// Initialize with default metrics collector if available
 		r.routeMetrics = NewDefaultMetricsCollector()
+	}
+}
+
+// Add this method to the RouterImpl struct in router.go
+
+func (r *RouterImpl) ServeHTTP(ctx *fasthttp.RequestCtx) {
+	// Create a new routing context
+	c := &routing.Context{RequestCtx: ctx}
+
+	// Create metrics tags
+	tags := tagsPool.Get().(map[string]string)
+	tags["method"] = string(ctx.Method())
+	tags["path"] = string(ctx.Path())
+	defer func() {
+		// Clean up the map before returning it to the pool
+		for k := range tags {
+			delete(tags, k)
+		}
+		tagsPool.Put(tags)
+	}()
+
+	// Record request start time
+	start := time.Now()
+
+	// Handle panics
+	defer func() {
+		if rcv := recover(); rcv != nil {
+			if r.panicHandler != nil {
+				impl := newContextImpl(c)
+				r.panicHandler(impl, rcv)
+			} else {
+				ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
+			}
+
+			if r.routeMetrics != nil {
+				r.routeMetrics.IncrementCounter("router.panic",
+					map[string]string{
+						"method": string(ctx.Method()),
+						"path":   string(ctx.Path()),
+					})
+			}
+		}
+
+		// Record request duration
+		if r.routeMetrics != nil {
+			duration := time.Since(start)
+			r.routeMetrics.RecordTiming("router.request.duration",
+				duration,
+				tags)
+		}
+	}()
+
+	// Handle the request using the router
+	r.router.HandleRequest(ctx)
+
+	// Check for any error status codes
+	if c.Response.StatusCode() >= 400 {
+		if r.routeMetrics != nil {
+			r.routeMetrics.IncrementCounter("router.error",
+				tags)
+		}
 	}
 }

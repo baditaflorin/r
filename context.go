@@ -39,6 +39,8 @@ type Context interface {
 	Error() error
 	Set(key string, value interface{})
 	Get(key string) (interface{}, bool)
+	SetStatus(code int)
+	ErrorResponse(code int, msg string)
 }
 
 // ContextImpl implements the enhanced Context interface
@@ -295,12 +297,26 @@ func (c *ContextImpl) IsWebSocket() bool {
 
 func (c *ContextImpl) Abort() {
 	c.aborted = true
-	c.handlerIdx = len(c.handlers) // Skip remaining handlers
+	c.handlerIdx = len(c.handlers)
 }
 
 func (c *ContextImpl) AbortWithError(code int, err error) {
+	// Set the error
 	c.err = err
-	c.Response.SetStatusCode(code)
+
+	// Set status code in both routing context and response
+	c.RequestCtx().Response.SetStatusCode(code)
+	c.RequestCtx().SetStatusCode(code)
+
+	// Mark as aborted and stop handler chain
+	c.aborted = true
+	c.handlerIdx = len(c.handlers)
+}
+
+func (c *ContextImpl) ErrorResponse(code int, msg string) {
+	c.RequestCtx().Response.SetStatusCode(code)
+	c.RequestCtx().SetStatusCode(code)
+	c.RequestCtx().Response.SetBodyString(msg)
 	c.Abort()
 }
 
@@ -414,4 +430,9 @@ func TestContextWithTimeout(parent Context, timeout time.Duration) (Context, con
 		startTime: time.Now(),
 	}
 	return timeoutCtx, cancel
+}
+
+// Add this helper method to the Context interface
+func (c *ContextImpl) SetStatus(code int) {
+	c.RequestCtx().Response.SetStatusCode(code)
 }

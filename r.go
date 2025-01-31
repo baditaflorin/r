@@ -171,23 +171,34 @@ func (r *RouterImpl) WS(path string, handler WSHandler) Router {
 
 // Group implements Router.Group
 func (r *RouterImpl) Group(prefix string) Router {
-	return &RouterImpl{
-		router: r.router,
-		group:  r.group.Group(prefix),
+	newGroup := r.group.Group(prefix)
+	newRouter := &RouterImpl{
+		router:       r.router,
+		group:        newGroup,
+		middleware:   make([]HandlerFunc, len(r.middleware)),
+		routes:       make(map[string]*Route),
+		routeMetrics: r.routeMetrics,
+		upgrader:     r.upgrader,
 	}
+
+	// Copy middleware to the new group
+	copy(newRouter.middleware, r.middleware)
+
+	return newRouter
 }
 
 // Use implements Router.Use
 func (r *RouterImpl) Use(middleware ...MiddlewareFunc) Router {
+	// Store middleware in our slice
+	r.middleware = append(r.middleware, middleware...)
+
+	// Add to the underlying route group
 	for _, m := range middleware {
+		m := m // Capture for closure
 		r.group.Use(func(c *routing.Context) error {
 			ctx := newContextImpl(c)
-			// Since HandlerFunc and MiddlewareFunc are now the same type,
-			// we can directly append the middleware
-			ctx.handlers = append(ctx.handlers, m)
-			ctx.handlerIdx = -1
-			ctx.Next()
-			return nil
+			m(ctx)
+			return ctx.Error()
 		})
 	}
 	return r

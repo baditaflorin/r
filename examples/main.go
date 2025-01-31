@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"github.com/baditaflorin/l"
 	"github.com/baditaflorin/r"
 	"os"
@@ -112,6 +113,17 @@ func main() {
 		)
 		reqLogger.Info("Handling ping request")
 		ctx.String(200, "pong")
+	})
+
+	// Add error test endpoint
+	router.GET("/error", func(ctx r.Context) {
+		reqLogger := baseLogger.With(
+			"request_id", ctx.RequestID(),
+			"method", ctx.Method(),
+			"path", ctx.Path(),
+		)
+		reqLogger.Info("Handling error test request")
+		ctx.AbortWithError(400, fmt.Errorf("test error"))
 	})
 
 	// Add JSON endpoint

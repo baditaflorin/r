@@ -11,8 +11,8 @@ import (
 	"os"
 	"runtime/debug"
 	"strconv"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,6 +43,8 @@ type RateLimiter interface {
 	Reset(key string)
 	SetDistributedClient(client RedisClient)
 	GetQuota(key string) (remaining int, reset time.Time)
+	GetDebugStats(key string) map[string]interface{} // Add this method
+
 }
 
 // SecurityProvider defines the interface for security header management
@@ -58,6 +60,23 @@ type CORSConfig struct {
 	MaxAge           int
 }
 
+// Add default CORS config function
+func defaultCORSConfig() *CORSConfig {
+	return &CORSConfig{
+		Origins: []string{"*"},
+		AllowMethods: []string{
+			"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS",
+		},
+		AllowHeaders: []string{
+			"Authorization", "Content-Type", "Accept", "Origin",
+			"User-Agent", "DNT", "Cache-Control", "X-Mx-ReqToken",
+			"Keep-Alive", "X-Requested-With", "If-Modified-Since",
+		},
+		AllowCredentials: true,
+		MaxAge:           86400,
+	}
+}
+
 // standardMiddleware implements MiddlewareProvider
 type standardMiddleware struct {
 	rateLimiter RateLimiter
@@ -71,18 +90,15 @@ type standardMiddleware struct {
 // NewMiddlewareProvider creates a new middleware provider with optional dependencies
 func NewMiddlewareProvider(router *RouterImpl, opts ...MiddlewareOption) MiddlewareProvider {
 	m := &standardMiddleware{
-		router: router,
-		corsConfig: &CORSConfig{
-			Origins:          []string{"*"},
-			AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-			AllowHeaders:     []string{"Authorization", "Content-Type"},
-			AllowCredentials: true,
-			MaxAge:           86400,
-		},
+		router:     router,
+		corsConfig: defaultCORSConfig(), // Use default config
 	}
+
+	// Apply any custom options
 	for _, opt := range opts {
 		opt(m)
 	}
+
 	return m
 }
 
@@ -98,20 +114,6 @@ func WithRateLimiter(rl RateLimiter) MiddlewareOption {
 
 // Default implementations
 
-type defaultRateLimiter struct {
-	tokens      map[string]float64
-	lastReq     map[string]time.Time
-	maxRate     float64
-	per         time.Duration
-	mu          sync.RWMutex
-	cleanupTick *time.Ticker
-	redisClient RedisClient
-	keyPrefix   string
-	logger      Logger
-	metrics     MetricsCollector
-	buckets     map[string]*tokenBucket // Add this field
-}
-
 // Update constructor to include new fields
 func NewDefaultRateLimiter(reqs int, per time.Duration, opts ...RateLimiterOption) RateLimiter {
 	rl := &defaultRateLimiter{
@@ -122,7 +124,8 @@ func NewDefaultRateLimiter(reqs int, per time.Duration, opts ...RateLimiterOptio
 		cleanupTick: time.NewTicker(time.Minute * 5),
 		keyPrefix:   "ratelimit",
 		logger:      NewDefaultLogger(),
-		buckets:     make(map[string]*tokenBucket), // Initialize buckets map
+		buckets:     make(map[string]*tokenBucket),
+		debugMode:   true, // Enable debug by default for investigation
 	}
 
 	// Apply options
@@ -130,7 +133,6 @@ func NewDefaultRateLimiter(reqs int, per time.Duration, opts ...RateLimiterOptio
 		opt(rl)
 	}
 
-	// Start cleanup goroutine
 	go rl.cleanup()
 	return rl
 }
@@ -148,7 +150,9 @@ func (rl *defaultRateLimiter) cleanup() {
 		rl.mu.Lock()
 		now := time.Now()
 		for key, bucket := range rl.buckets {
-			if now.Sub(bucket.lastRefill) > rl.per*2 {
+			// Convert atomic timestamp to time.Time
+			lastRefillTime := time.Unix(0, bucket.lastRefill.Load())
+			if now.Sub(lastRefillTime) > rl.per*2 {
 				delete(rl.buckets, key)
 				if rl.metrics != nil {
 					rl.metrics.IncrementCounter("rate_limiter.bucket_cleaned",
@@ -160,11 +164,35 @@ func (rl *defaultRateLimiter) cleanup() {
 	}
 }
 
-func (rl *defaultRateLimiter) Allow(key string) bool {
-	if rl.redisClient != nil {
-		return rl.distributedAllow(key)
+// tokenBucket stores the rate limiting state
+type tokenBucket struct {
+	tokens     atomic.Int64 // Store tokens * 1_000_000
+	lastRefill atomic.Int64 // Store UnixNano timestamp
+	stats      struct {
+		allowCount  atomic.Int64
+		rejectCount atomic.Int64
+		refillCount atomic.Int64
 	}
+}
 
+const tokenScale = 1_000_000 // Scale factor for fixed-point arithmetic
+
+type defaultRateLimiter struct {
+	tokens      map[string]float64
+	lastReq     map[string]time.Time
+	maxRate     float64
+	per         time.Duration
+	mu          sync.RWMutex
+	cleanupTick *time.Ticker
+	redisClient RedisClient
+	keyPrefix   string
+	logger      Logger
+	metrics     MetricsCollector
+	buckets     map[string]*tokenBucket
+	debugMode   bool
+}
+
+func (rl *defaultRateLimiter) Allow(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
@@ -172,51 +200,63 @@ func (rl *defaultRateLimiter) Allow(key string) bool {
 
 	bucket, exists := rl.buckets[key]
 	if !exists {
-		// Initialize new bucket
-		bucket = &tokenBucket{
-			tokens:     rl.maxRate,
-			lastRefill: now,
-		}
+		// First request, create new bucket with full tokens
+		bucket = &tokenBucket{}
+		bucket.tokens.Store(int64(rl.maxRate * tokenScale))
+		bucket.lastRefill.Store(now.UnixNano())
 		rl.buckets[key] = bucket
+		bucket.stats.allowCount.Add(1)
+
+		if rl.metrics != nil {
+			rl.metrics.IncrementCounter("rate_limiter.bucket_created",
+				map[string]string{"key": key})
+		}
+		return true
 	}
 
-	// Calculate token refill
-	elapsed := now.Sub(bucket.lastRefill).Seconds()
-	refill := elapsed * (rl.maxRate / rl.per.Seconds())
+	// Calculate elapsed time since last refill with nanosecond precision
+	lastRefillTime := time.Unix(0, bucket.lastRefill.Load())
+	elapsed := now.Sub(lastRefillTime).Seconds()
 
-	bucket.tokens = math.Min(rl.maxRate, bucket.tokens+refill)
-	bucket.lastRefill = now
+	// Calculate tokens to add with high precision
+	currentTokens := float64(bucket.tokens.Load()) / tokenScale
+	tokensToAdd := elapsed * (rl.maxRate / rl.per.Seconds())
 
-	// Check if we have enough tokens
-	if bucket.tokens < 1 {
+	// Add tokens and round up to prevent token loss from floating point rounding
+	newTokens := math.Min(rl.maxRate, currentTokens+tokensToAdd)
+
+	// Store new token count with scaling
+	bucket.tokens.Store(int64(newTokens * tokenScale))
+	bucket.lastRefill.Store(now.UnixNano())
+	bucket.stats.refillCount.Add(1)
+
+	// We need at least 1.0 tokens to allow the request
+	if newTokens >= 1.0 {
+		// Consume exactly one token
+		bucket.tokens.Add(-tokenScale)
+		bucket.stats.allowCount.Add(1)
+
 		if rl.metrics != nil {
-			rl.metrics.IncrementCounter("rate_limiter.rejected",
+			rl.metrics.IncrementCounter("rate_limiter.request_allowed",
 				map[string]string{
-					"key":    key,
-					"reason": "no_tokens",
+					"key":              key,
+					"tokens_remaining": fmt.Sprintf("%.2f", newTokens-1),
 				})
 		}
-		return false
+		return true
 	}
 
-	// Consume token
-	bucket.tokens--
-
+	bucket.stats.rejectCount.Add(1)
 	if rl.metrics != nil {
-		rl.metrics.RecordValue("rate_limiter.tokens_remaining",
-			bucket.tokens,
-			map[string]string{"key": key})
+		rl.metrics.IncrementCounter("rate_limiter.request_rejected",
+			map[string]string{
+				"key":              key,
+				"tokens_remaining": fmt.Sprintf("%.2f", newTokens),
+			})
 	}
-
-	return true
+	return false
 }
 
-type tokenBucket struct {
-	tokens     float64
-	lastRefill time.Time
-}
-
-// Original implementation becomes localAllow
 func (rl *defaultRateLimiter) localAllow(key string) bool {
 	now := time.Now()
 	if _, exists := rl.tokens[key]; !exists {
@@ -306,19 +346,19 @@ func (rl *defaultRateLimiter) GetQuota(key string) (remaining int, reset time.Ti
 		return int(rl.maxRate), time.Now()
 	}
 
-	// Calculate current tokens
-	now := time.Now()
-	elapsed := now.Sub(bucket.lastRefill).Seconds()
-	currentTokens := math.Min(rl.maxRate,
-		bucket.tokens+(elapsed*(rl.maxRate/rl.per.Seconds())))
+	currentTokens := bucket.tokens.Load()
+	lastRefillTime := time.Unix(0, bucket.lastRefill.Load())
 
-	// Calculate time until bucket is full
-	timeToFull := time.Duration(
-		((rl.maxRate - currentTokens) / (rl.maxRate / rl.per.Seconds())) *
-			float64(time.Second))
+	// Calculate tokens available
+	remainingTokens := float64(currentTokens) / tokenScale
 
-	return int(currentTokens), now.Add(timeToFull)
+	// Calculate time until next token
+	tokensPerNano := (rl.maxRate / rl.per.Seconds()) / float64(time.Second.Nanoseconds())
+	timeToNextToken := time.Duration(float64(tokenScale) / (tokensPerNano * float64(time.Second.Nanoseconds())))
+
+	return int(remainingTokens), lastRefillTime.Add(timeToNextToken)
 }
+
 func (rl *defaultRateLimiter) Reset(key string) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -378,26 +418,14 @@ func (m *standardMiddleware) RateLimit(reqs int, per time.Duration) MiddlewareFu
 	}
 
 	return func(c Context) {
-		if !m.rateLimiter.Allow(c.RealIP()) {
-			// Get a tags map from the pool
-			tags := tagsPool.Get().(map[string]string)
-			tags["key"] = c.RealIP()
-			tags["reason"] = "rate_limited"
-			defer func() {
-				// Clean up the map before putting it back
-				for k := range tags {
-					delete(tags, k)
-				}
-				tagsPool.Put(tags)
-			}()
-
-			// Increment counter using the MetricsCollector
-			if m.metrics != nil {
-				m.metrics.IncrementCounter("rate_limit_exceeded", tags)
-			}
-
-			// Abort the request with a 429 status code
-			c.AbortWithError(http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded"))
+		ip := c.RealIP()
+		if !m.rateLimiter.Allow(ip) {
+			remaining, reset := m.rateLimiter.GetQuota(ip)
+			c.SetHeader("X-RateLimit-Limit", fmt.Sprintf("%d", reqs))
+			c.SetHeader("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+			c.SetHeader("X-RateLimit-Reset", fmt.Sprintf("%d", reset.Unix()))
+			c.SetHeader("Retry-After", fmt.Sprintf("%d", int(time.Until(reset).Seconds())))
+			c.ErrorResponse(429, "rate limit exceeded")
 			return
 		}
 		c.Next()
@@ -405,48 +433,88 @@ func (m *standardMiddleware) RateLimit(reqs int, per time.Duration) MiddlewareFu
 }
 
 func (m *standardMiddleware) CORS(origins []string) MiddlewareFunc {
-	// If custom origins provided, override default config
-	if len(origins) > 0 {
-		m.corsConfig.Origins = origins
-	}
-
 	return func(c Context) {
-		origin := c.GetHeader("Origin")
+		ctx := c.RequestCtx()
+		origin := string(ctx.Request.Header.Peek("Origin"))
 
 		// Check if origin is allowed
 		allowed := false
-		for _, o := range m.corsConfig.Origins {
+		for _, o := range origins {
 			if o == "*" || o == origin {
 				allowed = true
 				break
 			}
 		}
 
-		if allowed {
-			c.SetHeader("Access-Control-Allow-Origin", origin)
-			c.SetHeader("Access-Control-Allow-Methods",
-				strings.Join(m.corsConfig.AllowMethods, ","))
-			c.SetHeader("Access-Control-Allow-Headers",
-				strings.Join(m.corsConfig.AllowHeaders, ","))
-
-			if m.corsConfig.AllowCredentials {
-				c.SetHeader("Access-Control-Allow-Credentials", "true")
-			}
-
-			if m.corsConfig.MaxAge > 0 {
-				c.SetHeader("Access-Control-Max-Age",
-					strconv.Itoa(m.corsConfig.MaxAge))
-			}
-
-			// Handle preflight requests
-			if c.Method() == "OPTIONS" {
-				c.AbortWithError(http.StatusNoContent, nil)
-				return
-			}
+		if !allowed {
+			c.Next()
+			return
 		}
+
+		// Check if this is a preflight request
+		if string(ctx.Method()) == "OPTIONS" {
+			// Set preflight headers
+			ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
+			ctx.Response.Header.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS")
+			ctx.Response.Header.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Origin, X-Requested-With")
+			ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
+			ctx.Response.Header.Set("Access-Control-Max-Age", "86400")
+
+			// Set status and return - do not call Next()
+			ctx.Response.SetStatusCode(204)
+			return
+		}
+
+		// For regular requests, set basic CORS headers
+		ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
+		ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
 
 		c.Next()
 	}
+}
+
+func handlePreflightRequest(c Context, origins []string) {
+	ctx := c.RequestCtx()
+	origin := string(ctx.Request.Header.Peek("Origin"))
+
+	// Check if origin is allowed
+	if !isOriginAllowed(origin, origins) {
+		return
+	}
+
+	// Set preflight response headers
+	headers := ctx.Response.Header
+	headers.Set("Access-Control-Allow-Origin", origin)
+	headers.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS")
+	headers.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Origin, X-Requested-With")
+	headers.Set("Access-Control-Allow-Credentials", "true")
+	headers.Set("Access-Control-Max-Age", "86400")
+
+	// Set status code and stop processing
+	ctx.SetStatusCode(204)
+}
+
+func handleSimpleRequest(c Context, origins []string) {
+	ctx := c.RequestCtx()
+	origin := string(ctx.Request.Header.Peek("Origin"))
+
+	if !isOriginAllowed(origin, origins) {
+		return
+	}
+
+	// Set simple response headers
+	headers := ctx.Response.Header
+	headers.Set("Access-Control-Allow-Origin", origin)
+	headers.Set("Access-Control-Allow-Credentials", "true")
+}
+
+func isOriginAllowed(origin string, allowedOrigins []string) bool {
+	for _, allowed := range allowedOrigins {
+		if allowed == "*" || allowed == origin {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *standardMiddleware) RequestID() MiddlewareFunc {
@@ -851,4 +919,27 @@ type ErrorContext struct {
 
 func (m *standardMiddleware) isDevelopment() bool {
 	return os.Getenv("APP_ENV") == "development"
+}
+
+func (rl *defaultRateLimiter) GetDebugStats(key string) map[string]interface{} {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+
+	bucket, exists := rl.buckets[key]
+	if !exists {
+		return map[string]interface{}{
+			"exists": false,
+		}
+	}
+
+	return map[string]interface{}{
+		"exists":         true,
+		"current_tokens": float64(bucket.tokens.Load()) / tokenScale,
+		"allow_count":    bucket.stats.allowCount.Load(),
+		"reject_count":   bucket.stats.rejectCount.Load(),
+		"refill_count":   bucket.stats.refillCount.Load(),
+		"last_refill":    time.Unix(0, bucket.lastRefill.Load()),
+		"max_rate":       rl.maxRate,
+		"period_seconds": rl.per.Seconds(),
+	}
 }
