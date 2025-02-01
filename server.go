@@ -1,15 +1,12 @@
 package r
 
 import (
-	"context"
 	"fmt"
-	"github.com/fasthttp/websocket"
 	"net/http"
 	"runtime/debug"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/valyala/fasthttp"
 )
 
@@ -74,27 +71,6 @@ func NewServer(config Config) *ServerImpl {
 	return s
 }
 
-func (s *ServerImpl) BuildHandler() fasthttp.RequestHandler {
-	return func(ctx *fasthttp.RequestCtx) {
-		c := newRoutingContext(ctx)
-		reqCtx := newContextImpl(c)
-
-		// Ensure request ID
-		if reqCtx.requestID == "" {
-			reqCtx.requestID = uuid.New().String()
-		}
-		ctx.Response.Header.Set("X-Request-ID", reqCtx.requestID)
-
-		// Handle request
-		s.router.ServeHTTP(ctx)
-
-		// Ensure status code is preserved
-		if statusCode := ctx.Response.StatusCode(); statusCode > 0 {
-			ctx.SetStatusCode(statusCode)
-		}
-	}
-}
-
 func (s *ServerImpl) Start(address string) error {
 	s.server = &fasthttp.Server{
 		Handler:            s.BuildHandler(),
@@ -108,113 +84,6 @@ func (s *ServerImpl) Start(address string) error {
 		return s.server.ListenAndServeTLS(address, s.config.CertFile, s.config.KeyFile)
 	}
 	return s.server.ListenAndServe(address)
-}
-
-func (s *ServerImpl) Stop() error {
-	// Signal we're starting shutdown
-	s.logger.Info("Starting graceful shutdown")
-
-	// Create context with server's shutdown timeout
-	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
-	defer cancel()
-
-	// Stop accepting new connections
-	s.server.DisableKeepalive = true
-
-	// Track cleanup tasks
-	var wg sync.WaitGroup
-	errCh := make(chan error, 4)
-
-	// 1. Shutdown HTTP server with graceful connection draining
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.logger.Info("Stopping HTTP server")
-
-		if err := s.server.ShutdownWithContext(ctx); err != nil {
-			errCh <- fmt.Errorf("HTTP server shutdown error: %w", err)
-			return
-		}
-
-		s.logger.Info("HTTP server stopped successfully")
-	}()
-
-	// 2. Drain WebSocket connections
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		deadline := time.Now().Add(s.shutdownTimeout / 2)
-
-		s.activeConns.Range(func(key, value interface{}) bool {
-			if conn, ok := value.(WSConnection); ok {
-				// Send close message to clients
-				closeMsg := websocket.FormatCloseMessage(
-					websocket.CloseServiceRestart,
-					"Server is shutting down",
-				)
-
-				if err := conn.WriteMessage(websocket.CloseMessage, closeMsg); err != nil {
-					s.logger.Error("Failed to send close message",
-						"error", err,
-						"conn_id", conn.ID())
-				}
-
-				// Set deadline for graceful close
-				conn.SetReadDeadline(deadline)
-				conn.SetWriteDeadline(deadline)
-			}
-			return true
-		})
-
-		s.logger.Info("WebSocket connections drained")
-	}()
-
-	// 3. Cleanup resources
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		// Close metrics collector
-		if s.metricsCollector != nil {
-			if err := s.metricsCollector.Close(); err != nil {
-				errCh <- fmt.Errorf("metrics collector shutdown error: %w", err)
-			}
-		}
-
-		// Flush logs
-		if syncer, ok := s.logger.(interface{ Sync() error }); ok {
-			if err := syncer.Sync(); err != nil {
-				errCh <- fmt.Errorf("logger sync error: %w", err)
-			}
-		}
-
-		s.logger.Info("Resources cleaned up")
-	}()
-
-	// Wait for cleanup with timeout
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	// Wait for either completion or timeout
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("shutdown timeout exceeded: %w", ctx.Err())
-	case <-done:
-		// Check for any errors
-		close(errCh)
-		var errors []error
-		for err := range errCh {
-			errors = append(errors, err)
-		}
-		if len(errors) > 0 {
-			return fmt.Errorf("shutdown completed with errors: %v", errors)
-		}
-		s.logger.Info("Server shutdown completed successfully")
-		return nil
-	}
 }
 
 func (s *ServerImpl) WithLogger(logger Logger) *ServerImpl {

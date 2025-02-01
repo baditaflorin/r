@@ -1,7 +1,6 @@
 package r
 
 import (
-	"fmt"
 	"github.com/fasthttp/websocket"
 	"github.com/qiangxue/fasthttp-routing"
 	"github.com/valyala/fasthttp"
@@ -174,35 +173,7 @@ func (r *RouterImpl) PanicHandler(handler PanicHandlerFunc) {
 }
 
 func (r *RouterImpl) wrapHandlers(handlers ...HandlerFunc) []routing.Handler {
-	wrapped := make([]routing.Handler, len(handlers))
-
-	for i, h := range handlers {
-		handler := h
-		wrapped[i] = func(c *routing.Context) error {
-			ctx := newContextImpl(c)
-
-			allHandlers := make([]HandlerFunc, 0, len(r.middleware)+1)
-			allHandlers = append(allHandlers, r.middleware...)
-			allHandlers = append(allHandlers, handler)
-
-			ctx.handlers = allHandlers
-			ctx.handlerIdx = -1
-
-			// Execute chain
-			ctx.Next()
-
-			// Get status code
-			statusCode := ctx.RequestCtx().Response.StatusCode()
-			if statusCode > 0 {
-				// Ensure routing context has same status
-				c.SetStatusCode(statusCode)
-			}
-
-			// Return error if we have one
-			return ctx.Error()
-		}
-	}
-	return wrapped
+	return wrapHandlers(r, handlers...)
 }
 
 func staticHandler(prefix, root string) routing.Handler {
@@ -229,37 +200,6 @@ func staticHandler(prefix, root string) routing.Handler {
 	}
 }
 
-func (r *RouterImpl) addRouteMetadata(method, path string, handlers ...HandlerFunc) {
-	r.initializeIfNeeded()
-	r.routesMu.Lock()
-	defer r.routesMu.Unlock()
-
-	route := &Route{
-		Path:   path,
-		Method: method,
-		Added:  time.Now(),
-	}
-
-	// Validate route if validator is configured
-	if r.validator != nil {
-		if err := r.validator.ValidateRoute(path, method); err != nil {
-			r.panicHandler(nil, fmt.Sprintf("invalid route %s %s: %v", method, path, err))
-			return
-		}
-	}
-
-	// Add metrics collection
-	if r.routeMetrics != nil {
-		r.routeMetrics.IncrementCounter("route.registered", map[string]string{
-			"method": method,
-			"path":   path,
-		})
-	}
-
-	routeKey := method + path
-	r.routes[routeKey] = route
-}
-
 // Add helper methods for route introspection
 func (r *RouterImpl) GetRoutes() []*Route {
 	r.routesMu.RLock()
@@ -272,32 +212,8 @@ func (r *RouterImpl) GetRoutes() []*Route {
 	return routes
 }
 
-// Add method to update route metrics
 func (r *RouterImpl) updateRouteMetrics(method, path string, duration time.Duration, err error) {
-	if r.routeMetrics == nil {
-		return // Skip metrics collection if not configured
-	}
-
-	routeKey := method + path
-	r.routesMu.RLock()
-	route, exists := r.routes[routeKey]
-	r.routesMu.RUnlock()
-
-	if !exists {
-		return
-	}
-
-	route.totalCalls.Add(1)
-	route.lastCalled.Store(time.Now().UnixNano())
-
-	if err != nil {
-		route.errorCount.Add(1)
-	}
-
-	// Update average latency using exponential moving average
-	currentAvg := float64(route.avgLatency.Load())
-	newAvg := (currentAvg*0.9 + float64(duration.Nanoseconds())*0.1)
-	route.avgLatency.Store(int64(newAvg))
+	UpdateRouteMetrics(r, method, path, duration, err)
 }
 
 func (r *RouterImpl) initializeIfNeeded() {

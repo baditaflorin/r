@@ -1,11 +1,9 @@
 package r
 
 import (
-	"bytes"
 	"fmt"
 	"github.com/fasthttp/websocket"
 	"github.com/google/uuid"
-	"io"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -232,105 +230,6 @@ func (c *wsConnection) RemoteAddr() string {
 	return c.Conn.RemoteAddr().String()
 }
 
-// readPump handles incoming WebSocket messages
-type wsConfig struct {
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	PingInterval time.Duration
-	PongWait     time.Duration
-	MessageSize  int64
-}
-
-func defaultWSConfig() wsConfig {
-	return wsConfig{
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		PingInterval: 54 * time.Second,
-		PongWait:     60 * time.Second,
-		MessageSize:  512 * 1024, // 512KB
-	}
-}
-
-func (c *wsConnection) readPump() {
-	defer func() {
-		if r := recover(); r != nil {
-			c.logger.Error("Panic in WebSocket read pump",
-				"error", fmt.Sprintf("%v", r),
-				"stack", string(debug.Stack()),
-				"conn_id", c.id)
-		}
-		c.Close()
-	}()
-
-	c.SetReadLimit(10 * 1024 * 1024)                   // 10MB max message size
-	c.SetReadDeadline(time.Now().Add(5 * time.Second)) // Reduced from 60s to 5s
-
-	// Update close handler to capture close code
-	c.SetCloseHandler(func(code int, text string) error {
-		c.mu.Lock()
-		c.closeCode = code
-		c.closeReason = text
-		c.mu.Unlock()
-		c.state.Store(wsStateClosed)
-		return nil
-	})
-
-	c.SetPongHandler(func(string) error {
-		c.SetReadDeadline(time.Now().Add(5 * time.Second))
-		return nil
-	})
-
-	for {
-		messageType, reader, err := c.NextReader()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err,
-				websocket.CloseGoingAway,
-				websocket.CloseAbnormalClosure) {
-				c.logger.Error("WebSocket read error",
-					"error", err,
-					"conn_id", c.id)
-			}
-			return
-		}
-
-		// Set up a limited reader to prevent memory exhaustion
-		limitedReader := io.LimitReader(reader, 10*1024*1024+1) // 10MB + 1 byte to detect overflow
-
-		// Use a buffer to read the message
-		buf := &bytes.Buffer{}
-		written, err := io.Copy(buf, limitedReader)
-
-		if err != nil {
-			c.logger.Error("Failed to read message",
-				"error", err,
-				"conn_id", c.id)
-			c.handleMessageError("Failed to read message")
-			return
-		}
-
-		// Check if message exceeds size limit
-		if written > 10*1024*1024 {
-			c.logger.Error("Message size exceeds limit",
-				"size", written,
-				"conn_id", c.id)
-			c.handleMessageError("Message size exceeds maximum allowed size of 10MB")
-			return
-		}
-
-		// Process valid message
-		if messageType == websocket.TextMessage || messageType == websocket.BinaryMessage {
-			message := buf.Bytes()
-			msgCopy := make([]byte, len(message))
-			copy(msgCopy, message)
-
-			if c.handler != nil {
-				c.handler.OnMessage(c, msgCopy)
-			}
-			c.msgCount.Add(1)
-		}
-	}
-}
-
 func (c *wsConnection) handleMessageError(msg string) {
 	// Send error message to client
 	closeMsg := websocket.FormatCloseMessage(
@@ -350,55 +249,6 @@ func (c *wsConnection) handleMessageError(msg string) {
 
 type WSErrorHandler interface {
 	OnError(conn WSConnection, err error)
-}
-
-func (c *wsConnection) writePump() {
-	ticker := time.NewTicker(54 * time.Second)
-	defer func() {
-		ticker.Stop()
-		if c.rateLimiter != nil {
-			c.rateLimiter.Stop()
-		}
-		c.Close()
-	}()
-
-	for {
-		select {
-		case message, ok := <-c.send:
-			if !ok {
-				// Channel was closed
-				err := c.WriteControl(
-					websocket.CloseMessage,
-					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-					time.Now().Add(time.Second),
-				)
-				if err != nil {
-					c.logger.Error("Error sending close message",
-						"error", err,
-						"conn_id", c.id)
-				}
-				return
-			}
-
-			c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			err := c.WriteMessage(websocket.TextMessage, message)
-			if err != nil {
-				c.logger.Error("Write error",
-					"error", err,
-					"conn_id", c.id)
-				return
-			}
-
-		case <-ticker.C:
-			c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := c.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
-
-		case <-c.closeCh:
-			return
-		}
-	}
 }
 
 func (c *wsConnection) Close() error {
@@ -427,53 +277,6 @@ func (c *wsConnection) Close() error {
 		}
 	})
 	return err
-}
-
-func (c *wsConnection) WriteMessage(messageType int, data []byte) error {
-	if c == nil || c.Conn == nil {
-		return fmt.Errorf("connection is nil")
-	}
-	if c.state.Load() != wsStateActive {
-		return ErrConnectionClosed
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.writeBuffer == nil || c.rateLimiter == nil {
-		return fmt.Errorf("connection not properly initialized")
-	}
-
-	// Try sending the message with a short timeout before giving up.
-	select {
-	case <-c.rateLimiter.C:
-		select {
-		case c.writeBuffer <- data:
-			// Successfully queued message.
-		case <-time.After(10 * time.Millisecond): // wait a little bit
-			if c.dropMessagesOnFull {
-				if c.metrics != nil {
-					c.metrics.IncrementCounter("ws.messages.dropped", map[string]string{
-						"reason":  "buffer_full",
-						"conn_id": c.id,
-					})
-				}
-				return ErrBufferFull
-			}
-		}
-		if c.metrics != nil {
-			c.metrics.IncrementCounter("ws.messages.buffered", map[string]string{
-				"conn_id": c.id,
-			})
-		}
-		return nil
-	default:
-		if c.metrics != nil {
-			c.metrics.IncrementCounter("ws.messages.dropped", map[string]string{
-				"reason":  "rate_limited",
-				"conn_id": c.id,
-			})
-		}
-		return ErrRateLimited
-	}
 }
 
 var (
@@ -642,32 +445,6 @@ func (cm *ConnectionManager) monitorConnection(conn *wsConnection) {
 		case <-conn.closeCh:
 			cm.Remove(conn)
 			return
-		}
-	}
-}
-
-func (cm *ConnectionManager) periodicCleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		staleCount := 0
-		cm.connections.Range(func(key, value interface{}) bool {
-			conn := value.(*wsConnection)
-			if time.Since(time.Unix(0, conn.lastPing.Load())) > 10*time.Minute {
-				cm.logger.Warn("Removing stale connection",
-					"conn_id", conn.ID(),
-					"last_ping", time.Unix(0, conn.lastPing.Load()))
-				conn.Close()
-				cm.Remove(conn)
-				staleCount++
-			}
-			return true
-		})
-
-		if cm.metrics != nil && staleCount > 0 {
-			cm.metrics.IncrementCounter("ws.connections.cleaned",
-				map[string]string{"count": fmt.Sprintf("%d", staleCount)})
 		}
 	}
 }
