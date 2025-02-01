@@ -16,11 +16,14 @@ type testWSHandler struct {
 	connectCalled   bool
 	messageReceived []byte
 	closeCalled     bool
-	messageCount    int      // Add counter for concurrent test
-	errorReceived   bool     // New field for tracking errors
-	messages        [][]byte // Store all messages for verification
-	mu              sync.Mutex
-	t               *testing.T
+	closeCode       int    // Add this field for close code testing
+	lastCloseReason string // Add this for storing close reason
+
+	messageCount  int      // Add counter for concurrent test
+	errorReceived bool     // New field for tracking errors
+	messages      [][]byte // Store all messages for verification
+	mu            sync.Mutex
+	t             *testing.T
 }
 
 func newTestHandler(t *testing.T) *testWSHandler {
@@ -30,6 +33,7 @@ func newTestHandler(t *testing.T) *testWSHandler {
 	}
 }
 
+// testWSHandler needs to implement message echoing
 func (h *testWSHandler) OnMessage(conn r.WSConnection, msg []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -42,6 +46,11 @@ func (h *testWSHandler) OnMessage(conn r.WSConnection, msg []byte) {
 	msgCopy := make([]byte, len(msg))
 	copy(msgCopy, msg)
 	h.messages = append(h.messages, msgCopy)
+
+	// Echo the message back
+	if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		h.t.Logf("Failed to echo message: %v", err)
+	}
 
 	// Increment message count
 	h.messageCount++
@@ -67,7 +76,19 @@ func (h *testWSHandler) OnClose(conn r.WSConnection) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.closeCalled = true
-	h.t.Log("OnClose called")
+
+	// Try to get the close code if available
+	if wsConn, ok := conn.(r.WSConnection); ok {
+		if code, reason := wsConn.CloseCode(); code > 0 {
+			h.closeCode = code
+			h.lastCloseReason = reason
+			h.t.Logf("OnClose called with code: %d, reason: %s", code, reason)
+		} else {
+			h.t.Log("OnClose called (no close code available)")
+		}
+	} else {
+		h.t.Log("OnClose called")
+	}
 }
 
 // Helper function to start test server
@@ -252,9 +273,84 @@ func TestWebSocket_EmptyMessage(t *testing.T) {
 	}
 }
 
+func TestWebSocket_MessageTypes(t *testing.T) {
+	handler := newTestHandler(t)
+	url, cleanup := startTestServer(t, handler)
+	defer cleanup()
+
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	// Test text message
+	textMsg := "Hello, World!"
+	err = conn.WriteMessage(websocket.TextMessage, []byte(textMsg))
+	if err != nil {
+		t.Fatalf("Failed to send text message: %v", err)
+	}
+
+	// Test binary message
+	binaryMsg := []byte{0x01, 0x02, 0x03, 0x04}
+	err = conn.WriteMessage(websocket.BinaryMessage, binaryMsg)
+	if err != nil {
+		t.Fatalf("Failed to send binary message: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+
+	if handler.messageCount != 2 {
+		t.Errorf("Expected 2 messages, got %d", handler.messageCount)
+	}
+}
+
+func TestWebSocket_CloseCode(t *testing.T) {
+	handler := newTestHandler(t)
+	url, cleanup := startTestServer(t, handler)
+	defer cleanup()
+
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+
+	// Send close frame with custom code and message
+	closeCode := websocket.CloseGoingAway
+	closeText := "Client going away"
+	err = conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(closeCode, closeText),
+		time.Now().Add(time.Second))
+
+	if err != nil {
+		t.Fatalf("Failed to send close frame: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	handler.mu.Lock()
+	if !handler.closeCalled {
+		t.Error("Close handler was not called")
+	}
+	if handler.closeCode != closeCode {
+		t.Errorf("Expected close code %d, got %d", closeCode, handler.closeCode)
+	}
+	handler.mu.Unlock()
+}
+
 func (h *testWSHandler) OnError(conn r.WSConnection, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.errorReceived = true
 	h.t.Logf("WebSocket error received: %v", err)
+}
+
+func (h *testWSHandler) OnCloseCode(conn r.WSConnection, code int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.closeCode = code
+	h.t.Logf("OnCloseCode called with code: %d", code)
 }

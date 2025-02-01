@@ -42,21 +42,27 @@ func NewWSConn(conn *websocket.Conn, logger Logger, handler WSHandler) *wsConnec
 	}
 
 	wsConn := &wsConnection{
-		Conn:    conn,
-		id:      uuid.New().String(),
-		send:    make(chan []byte, 256),
-		closeCh: make(chan struct{}),
-		logger:  logger,
-		handler: handler, // Store the handler
+		Conn:        conn,
+		id:          uuid.New().String(),
+		send:        make(chan []byte, 256),
+		closeCh:     make(chan struct{}),
+		logger:      logger,
+		handler:     handler,                          // Store the handler
+		rateLimiter: time.NewTicker(time.Millisecond), // Initialize rate limiter
 	}
 
 	// Set initial state
 	wsConn.state.Store(wsStateActive)
 	wsConn.lastPing.Store(time.Now().UnixNano())
+	wsConn.writeBuffer = make(chan []byte, 1024)
+	// Start the read and write pumps in a way that ensures proper initialization
+	go func() {
+		wsConn.readPump()
+	}()
 
-	// Start the read and write pumps
-	go wsConn.readPump()
-	go wsConn.writePump()
+	go func() {
+		wsConn.writePump()
+	}()
 
 	// Call OnConnect after pumps are started
 	if handler != nil {
@@ -127,6 +133,7 @@ type WSConnection interface {
 	SetWriteDeadline(t time.Time) error
 	ID() string
 	RemoteAddr() string
+	CloseCode() (int, string)
 }
 
 // wsConnection wraps a websocket connection
@@ -158,6 +165,10 @@ type wsConnection struct {
 
 	handler          WSHandler // Add handler reference
 	messageValidator func([]byte) error
+
+	closeCode   int    // Add this field
+	closeReason string // Add this field
+
 }
 
 const (
@@ -241,11 +252,21 @@ func (c *wsConnection) readPump() {
 		c.Close()
 	}()
 
-	c.SetReadLimit(10 * 1024 * 1024) // 10MB max message size
-	c.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.SetReadLimit(10 * 1024 * 1024)                   // 10MB max message size
+	c.SetReadDeadline(time.Now().Add(5 * time.Second)) // Reduced from 60s to 5s
+
+	// Update close handler to capture close code
+	c.SetCloseHandler(func(code int, text string) error {
+		c.mu.Lock()
+		c.closeCode = code
+		c.closeReason = text
+		c.mu.Unlock()
+		c.state.Store(wsStateClosed)
+		return nil
+	})
 
 	c.SetPongHandler(func(string) error {
-		c.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
 		return nil
 	})
 
@@ -325,6 +346,9 @@ func (c *wsConnection) writePump() {
 	ticker := time.NewTicker(54 * time.Second)
 	defer func() {
 		ticker.Stop()
+		if c.rateLimiter != nil {
+			c.rateLimiter.Stop()
+		}
 		c.Close()
 	}()
 
@@ -332,7 +356,17 @@ func (c *wsConnection) writePump() {
 		select {
 		case message, ok := <-c.send:
 			if !ok {
-				c.WriteMessage(websocket.CloseMessage, []byte{})
+				// Channel was closed
+				err := c.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+					time.Now().Add(time.Second),
+				)
+				if err != nil {
+					c.logger.Error("Error sending close message",
+						"error", err,
+						"conn_id", c.id)
+				}
 				return
 			}
 
@@ -381,8 +415,19 @@ func (c *wsConnection) Close() error {
 }
 
 func (c *wsConnection) WriteMessage(messageType int, data []byte) error {
+	if c == nil || c.Conn == nil {
+		return fmt.Errorf("connection is nil")
+	}
+
 	if c.state.Load() != wsStateActive {
 		return ErrConnectionClosed
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.writeBuffer == nil || c.rateLimiter == nil {
+		return fmt.Errorf("connection not properly initialized")
 	}
 
 	select {
@@ -666,4 +711,10 @@ func GetConnectionStats() map[string]interface{} {
 	stats["connections_by_state"] = stateCount
 
 	return stats
+}
+
+func (c *wsConnection) CloseCode() (int, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeCode, c.closeReason
 }
