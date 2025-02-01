@@ -24,7 +24,7 @@ func TestRouter_StaticFileServing(t *testing.T) {
 	router.Static("/static", tmpDir)
 
 	// Create a test context simulating a GET request for the file.
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.RequestCtx().Request.Header.SetMethod("GET")
 	ctx.RequestCtx().Request.SetRequestURI("/static/test.txt")
 

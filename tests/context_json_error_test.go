@@ -7,7 +7,7 @@ import (
 
 // TestContext_JSONError verifies that passing an unencodable value results in an error.
 func TestContext_JSONError(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 
 	// Use a channel, which is not JSON serializable.
 	invalidValue := make(chan int)

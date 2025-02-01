@@ -6,7 +6,7 @@ import (
 )
 
 func TestContext_Redirect(t *testing.T) {
-	ctx := createTestContext() // reuse your helper from context_test.go
+	ctx := CreateTestContext() // reuse your helper from context_test.go
 	redirectURL := "http://example.com"
 
 	// Call the Redirect method with status 302

@@ -41,30 +41,40 @@ func NewWSConn(conn *websocket.Conn, logger Logger, handler WSHandler) *wsConnec
 		logger = NewDefaultLogger()
 	}
 
+	// Initialize the connection manager if needed.
+	once.Do(func() {
+		defaultConnectionManager = NewConnectionManager(
+			10000, // max connections
+			NewDefaultMetricsCollector(),
+			logger,
+		)
+	})
+
 	wsConn := &wsConnection{
 		Conn:        conn,
 		id:          uuid.New().String(),
 		send:        make(chan []byte, 256),
 		closeCh:     make(chan struct{}),
 		logger:      logger,
-		handler:     handler,                          // Store the handler
-		rateLimiter: time.NewTicker(time.Millisecond), // Initialize rate limiter
+		handler:     handler,
+		rateLimiter: time.NewTicker(time.Millisecond),
 	}
-
-	// Set initial state
 	wsConn.state.Store(wsStateActive)
 	wsConn.lastPing.Store(time.Now().UnixNano())
 	wsConn.writeBuffer = make(chan []byte, 1024)
-	// Start the read and write pumps in a way that ensures proper initialization
-	go func() {
-		wsConn.readPump()
-	}()
 
-	go func() {
-		wsConn.writePump()
-	}()
+	// Add the connection to the manager.
+	if defaultConnectionManager != nil {
+		if err := defaultConnectionManager.Add(wsConn); err != nil {
+			logger.Error("Failed to add connection", "error", err, "conn_id", wsConn.id)
+			conn.Close()
+			return nil
+		}
+	}
 
-	// Call OnConnect after pumps are started
+	go wsConn.readPump()
+	go wsConn.writePump()
+
 	if handler != nil {
 		handler.OnConnect(wsConn)
 	}
@@ -410,6 +420,11 @@ func (c *wsConnection) Close() error {
 
 		// Mark as fully closed
 		c.state.Store(wsStateClosed)
+
+		// Remove the connection from the manager so that stats update correctly.
+		if defaultConnectionManager != nil {
+			defaultConnectionManager.Remove(c)
+		}
 	})
 	return err
 }
@@ -418,28 +433,22 @@ func (c *wsConnection) WriteMessage(messageType int, data []byte) error {
 	if c == nil || c.Conn == nil {
 		return fmt.Errorf("connection is nil")
 	}
-
 	if c.state.Load() != wsStateActive {
 		return ErrConnectionClosed
 	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	if c.writeBuffer == nil || c.rateLimiter == nil {
 		return fmt.Errorf("connection not properly initialized")
 	}
 
+	// Try sending the message with a short timeout before giving up.
 	select {
 	case <-c.rateLimiter.C:
 		select {
 		case c.writeBuffer <- data:
-			if c.metrics != nil {
-				c.metrics.IncrementCounter("ws.messages.buffered", map[string]string{
-					"conn_id": c.id,
-				})
-			}
-		default:
+			// Successfully queued message.
+		case <-time.After(10 * time.Millisecond): // wait a little bit
 			if c.dropMessagesOnFull {
 				if c.metrics != nil {
 					c.metrics.IncrementCounter("ws.messages.dropped", map[string]string{
@@ -449,21 +458,12 @@ func (c *wsConnection) WriteMessage(messageType int, data []byte) error {
 				}
 				return ErrBufferFull
 			}
-			// Wait for space
-			select {
-			case c.writeBuffer <- data:
-				// Message sent
-			case <-c.closeCh:
-				return ErrConnectionClosed
-			}
 		}
-
 		if c.metrics != nil {
 			c.metrics.IncrementCounter("ws.messages.buffered", map[string]string{
 				"conn_id": c.id,
 			})
 		}
-
 		return nil
 	default:
 		if c.metrics != nil {

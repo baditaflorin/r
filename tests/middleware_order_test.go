@@ -38,7 +38,7 @@ func TestMiddleware_Order(t *testing.T) {
 	})
 
 	// Create a test context simulating a GET request.
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.RequestCtx().Request.Header.SetMethod("GET")
 	ctx.RequestCtx().Request.SetRequestURI("/order")
 

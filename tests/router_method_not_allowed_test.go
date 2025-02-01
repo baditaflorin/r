@@ -23,7 +23,7 @@ func TestRouter_MethodNotAllowed(t *testing.T) {
 	})
 
 	// Create a test context simulating a POST request (which is not allowed).
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.RequestCtx().Request.Header.SetMethod("POST")
 	ctx.RequestCtx().Request.SetRequestURI("/test")
 

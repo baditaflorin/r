@@ -1,6 +1,7 @@
 package r
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/fasthttp/websocket"
 	"github.com/qiangxue/fasthttp-routing"
@@ -34,11 +35,12 @@ type PanicHandlerFunc func(Context, interface{})
 
 // RouterImpl implements the Router interface using fasthttp-routing
 type RouterImpl struct {
-	router     *routing.Router
-	group      *routing.RouteGroup
-	upgrader   websocket.FastHTTPUpgrader
-	middleware []HandlerFunc // Add this field to store middleware
-	logger     Logger
+	router          *routing.Router
+	group           *routing.RouteGroup
+	upgrader        websocket.FastHTTPUpgrader
+	middleware      []HandlerFunc // Add this field to store middleware
+	logger          Logger
+	notFoundHandler HandlerFunc
 
 	panicHandler            PanicHandlerFunc
 	methodNotAllowedHandler HandlerFunc
@@ -153,6 +155,7 @@ func (r *RouterImpl) FileServer(path, root string) Router {
 }
 
 func (r *RouterImpl) NotFound(handler HandlerFunc) {
+	r.notFoundHandler = handler
 	r.router.NotFound(r.wrapHandlers(handler)[0])
 }
 
@@ -313,27 +316,27 @@ func (r *RouterImpl) initializeIfNeeded() {
 }
 
 // Add this method to the RouterImpl struct in router.go
-
+// ServeHTTP handles incoming requests.
 func (r *RouterImpl) ServeHTTP(ctx *fasthttp.RequestCtx) {
-	// Create a new routing context
+	// Create a new routing context wrapping the fasthttp.RequestCtx.
 	c := &routing.Context{RequestCtx: ctx}
 
-	// Create metrics tags
+	// Create metrics tags.
 	tags := tagsPool.Get().(map[string]string)
 	tags["method"] = string(ctx.Method())
 	tags["path"] = string(ctx.Path())
 	defer func() {
-		// Clean up the map before returning it to the pool
+		// Clean up the map before returning it to the pool.
 		for k := range tags {
 			delete(tags, k)
 		}
 		tagsPool.Put(tags)
 	}()
 
-	// Record request start time
+	// Record request start time.
 	start := time.Now()
 
-	// Handle panics
+	// Handle panics.
 	defer func() {
 		if rcv := recover(); rcv != nil {
 			if r.panicHandler != nil {
@@ -352,7 +355,7 @@ func (r *RouterImpl) ServeHTTP(ctx *fasthttp.RequestCtx) {
 			}
 		}
 
-		// Record request duration
+		// Record request duration.
 		if r.routeMetrics != nil {
 			duration := time.Since(start)
 			r.routeMetrics.RecordTiming("router.request.duration",
@@ -361,14 +364,27 @@ func (r *RouterImpl) ServeHTTP(ctx *fasthttp.RequestCtx) {
 		}
 	}()
 
-	// Handle the request using the router
+	// Handle the request using the underlying router.
 	r.router.HandleRequest(ctx)
 
-	// Check for any error status codes
+	// Only override the 404 response if no custom NotFound handler is set.
+	if ctx.Response.StatusCode() == fasthttp.StatusNotFound && r.notFoundHandler == nil {
+		ctx.Response.Header.SetContentType("application/json")
+		jsonBody, err := json.Marshal(map[string]string{
+			"error": "route not found",
+			"path":  string(ctx.Request.URI().Path()),
+		})
+		if err != nil {
+			ctx.Error("Not Found", fasthttp.StatusNotFound)
+		} else {
+			ctx.Response.SetBody(jsonBody)
+		}
+	}
+
+	// Check for any error status codes for metrics.
 	if c.Response.StatusCode() >= 400 {
 		if r.routeMetrics != nil {
-			r.routeMetrics.IncrementCounter("router.error",
-				tags)
+			r.routeMetrics.IncrementCounter("router.error", tags)
 		}
 	}
 }

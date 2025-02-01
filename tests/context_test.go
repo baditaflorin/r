@@ -10,15 +10,15 @@ import (
 	"time"
 )
 
-// createTestContext creates a new context for testing
-func createTestContext() r.Context {
+// CreateTestContext creates a new context for testing
+func CreateTestContext() r.Context {
 	ctx := &fasthttp.RequestCtx{}
 	routingCtx := &routing.Context{RequestCtx: ctx}
 	return r.NewTestContext(routingCtx)
 }
 
 func TestContext_SetAndGet(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.Set("key", "value")
 	if val, ok := ctx.Get("key"); !ok || val != "value" {
 		t.Errorf("Expected context value 'value', got %v", val)
@@ -26,7 +26,7 @@ func TestContext_SetAndGet(t *testing.T) {
 }
 
 func TestContext_Timeout(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	timeoutCtx, cancel := r.TestContextWithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
@@ -37,7 +37,7 @@ func TestContext_Timeout(t *testing.T) {
 }
 
 func TestContext_RequestID(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	if ctx.RequestID() == "" {
 		t.Errorf("Expected request ID to be generated")
 	}
@@ -61,7 +61,7 @@ func TestContext_Method(t *testing.T) {
 }
 
 func TestContext_Path(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.RequestCtx().Request.SetRequestURI("/test/path")
 	if ctx.Path() != "/test/path" {
 		t.Errorf("Expected path /test/path, got %s", ctx.Path())
@@ -69,7 +69,7 @@ func TestContext_Path(t *testing.T) {
 }
 
 func TestContext_QueryParam(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.RequestCtx().Request.SetRequestURI("/test?name=value")
 	if param := ctx.QueryParam("name"); param != "value" {
 		t.Errorf("Expected query parameter 'value', got %s", param)
@@ -77,7 +77,7 @@ func TestContext_QueryParam(t *testing.T) {
 }
 
 func TestContext_Headers(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.SetHeader("X-Test", "test-value")
 	if value := ctx.GetHeader("X-Test"); value != "test-value" {
 		t.Errorf("Expected header value 'test-value', got %s", value)
@@ -85,7 +85,7 @@ func TestContext_Headers(t *testing.T) {
 }
 
 func TestContext_JSON(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	testData := map[string]string{"key": "value"}
 
 	if err := ctx.JSON(200, testData); err != nil {
@@ -108,7 +108,7 @@ func TestContext_JSON(t *testing.T) {
 }
 
 func TestContext_String(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	testString := "test response"
 
 	if err := ctx.String(200, testString); err != nil {
@@ -122,7 +122,7 @@ func TestContext_String(t *testing.T) {
 }
 
 func TestContext_RealIP(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	testIP := "127.0.0.1"
 
 	ctx.SetHeader("X-Real-IP", testIP)
@@ -139,7 +139,7 @@ func TestContext_RealIP(t *testing.T) {
 
 // Fixed test implementation
 func TestContext_IsWebSocket(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 
 	// First check when it's not a WebSocket request
 	if ctx.IsWebSocket() {
@@ -205,7 +205,7 @@ func TestContext_AbortWithError(t *testing.T) {
 }
 
 func TestContext_Timeout_WithCancel(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	timeoutCtx, cancel := r.TestContextWithTimeout(ctx, 100*time.Millisecond)
 
 	// Test cancellation
@@ -218,7 +218,7 @@ func TestContext_Timeout_WithCancel(t *testing.T) {
 }
 
 func TestContext_SpanLifecycle(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 
 	// Add a span
 	start := time.Now()

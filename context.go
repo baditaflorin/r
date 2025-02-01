@@ -78,6 +78,19 @@ type tracingSpan struct {
 	children  []*tracingSpan
 }
 
+func (c *ContextImpl) Reset() {
+	c.requestID = ""
+	c.err = nil
+	c.aborted = false
+	c.handlerIdx = 0
+	c.handlers = nil
+	c.store = &sync.Map{}
+	c.errorStack = nil
+	c.spans = nil
+	c.timeouts = make(map[string]time.Duration)
+	// Reset any other fields that are per-request
+}
+
 func (c *ContextImpl) AddSpan(name string, metadata map[string]string) {
 	span := &tracingSpan{
 		Name:      name,
@@ -183,6 +196,9 @@ func (c *ContextImpl) Cleanup() {
 	default:
 		close(c.done)
 	}
+	// Reset mutable state before putting back into pool.
+	c.Reset()
+	contextPool.Put(c)
 }
 
 func (c *ContextImpl) startSpan(name string, attributes map[string]string) *tracingSpan {
@@ -293,6 +309,10 @@ func (c *ContextImpl) IsWebSocket() bool {
 
 	// Check if the header exists and equals "websocket" (case-insensitive)
 	return len(upgrade) > 0 && bytes.EqualFold(upgrade, []byte("websocket"))
+}
+
+func (c *ContextImpl) Param(name string) string {
+	return c.Context.Param(name)
 }
 
 func (c *ContextImpl) Abort() {

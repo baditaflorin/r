@@ -34,7 +34,7 @@ func TestRouter_BasicRouting(t *testing.T) {
 	})
 
 	// Test GET request
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.RequestCtx().Request.Header.SetMethod("GET")
 	ctx.RequestCtx().Request.SetRequestURI("/test")
 
@@ -51,7 +51,7 @@ func TestRouter_BasicRouting(t *testing.T) {
 	}
 
 	// Test POST request
-	ctx = createTestContext()
+	ctx = CreateTestContext()
 	ctx.RequestCtx().Request.Header.SetMethod("POST")
 	ctx.RequestCtx().Request.SetRequestURI("/test")
 
@@ -78,7 +78,7 @@ func TestRouter_GroupRouting(t *testing.T) {
 	})
 
 	// Test request
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.RequestCtx().Request.Header.SetMethod("GET")
 	ctx.RequestCtx().Request.SetRequestURI("/api/test")
 
@@ -121,7 +121,7 @@ func TestRouter_Middleware(t *testing.T) {
 	})
 
 	// Test request
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.RequestCtx().Request.Header.SetMethod("GET")
 	ctx.RequestCtx().Request.SetRequestURI("/middleware-test")
 
@@ -158,7 +158,7 @@ func TestRouter_Middleware(t *testing.T) {
 //	})
 //
 //	// Test request
-//	ctx := createTestContext()
+//	ctx := CreateTestContext()
 //	ctx.RequestCtx().Request.Header.SetMethod("GET")
 //	ctx.RequestCtx().Request.SetRequestURI("/error")
 //

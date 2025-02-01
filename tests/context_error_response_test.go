@@ -6,7 +6,7 @@ import (
 )
 
 func TestContext_ErrorResponse(t *testing.T) {
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 
 	// Call ErrorResponse to send an error message and abort further processing.
 	ctx.ErrorResponse(400, "bad request")

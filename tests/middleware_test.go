@@ -2,6 +2,8 @@
 package r_test
 
 import (
+	"encoding/json"
+	"fmt"
 	"github.com/baditaflorin/r"
 	"github.com/valyala/fasthttp"
 	"testing"
@@ -29,7 +31,7 @@ func TestMiddleware_RateLimit(t *testing.T) {
 
 	// Helper function to make request and get status
 	makeRequest := func() int {
-		ctx := createTestContext()
+		ctx := CreateTestContext()
 		ctx.RequestCtx().Request.Header.SetMethod("GET")
 		ctx.RequestCtx().Request.SetRequestURI("/test")
 		ctx.RequestCtx().Request.Header.Set("X-Real-IP", "127.0.0.1")
@@ -140,7 +142,7 @@ func TestMiddleware_CORS(t *testing.T) {
 
 	// Test preflight request specifically
 	t.Run("OPTIONS_Preflight", func(t *testing.T) {
-		ctx := createTestContext()
+		ctx := CreateTestContext()
 
 		// Set up the preflight request
 		ctx.RequestCtx().Request.Header.Set("Origin", "http://allowed-origin.com")
@@ -187,4 +189,41 @@ func TestMiddleware_CORS(t *testing.T) {
 			t.Error("Access-Control-Allow-Headers header not set for preflight request")
 		}
 	})
+}
+
+func TestMiddleware_PanicHandling_InMiddleware(t *testing.T) {
+	router := r.NewRouter()
+	// Set a custom panic handler that returns a JSON error.
+	router.PanicHandler(func(c r.Context, rec interface{}) {
+		c.JSON(500, map[string]string{"error": fmt.Sprintf("panic: %v", rec)})
+	})
+
+	// Add a middleware that panics.
+	router.Use(func(c r.Context) {
+		panic("middleware panic")
+	})
+
+	// A normal handler (which should never be reached).
+	router.GET("/panic", func(c r.Context) {
+		c.String(200, "should not reach here")
+	})
+
+	ctx := CreateTestContext()
+	ctx.RequestCtx().Request.Header.SetMethod("GET")
+	ctx.RequestCtx().Request.SetRequestURI("/panic")
+
+	router.ServeHTTP(ctx.RequestCtx())
+
+	if ctx.RequestCtx().Response.StatusCode() != 500 {
+		t.Errorf("Expected status code 500, got %d", ctx.RequestCtx().Response.StatusCode())
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(ctx.RequestCtx().Response.Body(), &resp); err != nil {
+		t.Fatalf("Failed to parse JSON response: %v", err)
+	}
+	expectedMsg := "panic: middleware panic"
+	if resp["error"] != expectedMsg {
+		t.Errorf("Expected error message %q, got %q", expectedMsg, resp["error"])
+	}
 }

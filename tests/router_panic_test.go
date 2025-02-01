@@ -27,7 +27,7 @@ func TestRouter_PanicHandling(t *testing.T) {
 	})
 
 	// Create a test context for the /panic route.
-	ctx := createTestContext()
+	ctx := CreateTestContext()
 	ctx.RequestCtx().Request.Header.SetMethod("GET")
 	ctx.RequestCtx().Request.SetRequestURI("/panic")
 	router.ServeHTTP(ctx.RequestCtx())

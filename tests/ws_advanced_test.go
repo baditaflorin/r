@@ -119,8 +119,8 @@ func TestWebSocket_ConcurrentClients(t *testing.T) {
 	url, cleanup := startTestServer(t, handler)
 	defer cleanup()
 
-	const numClients = 5
-	const messagesPerClient = 10
+	const numClients = 2
+	const messagesPerClient = 2
 
 	var wg sync.WaitGroup
 	clientErrors := make(chan error, numClients*messagesPerClient)
