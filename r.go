@@ -187,18 +187,18 @@ func (r *RouterImpl) Group(prefix string) Router {
 
 // Use implements Router.Use
 func (r *RouterImpl) Use(middleware ...MiddlewareFunc) Router {
-	// Store middleware in our slice
+	// Store middleware in our slice.
 	r.middleware = append(r.middleware, middleware...)
 
-	// Add to the underlying route group
-	for _, m := range middleware {
-		m := m // Capture for closure
-		r.group.Use(func(c *routing.Context) error {
-			ctx := newContextImpl(c)
-			m(ctx)
-			return ctx.Error()
-		})
-	}
+	// Remove the following block that adds them to the group:
+	// for _, m := range middleware {
+	//     m := m // capture for closure
+	//     r.group.Use(func(c *routing.Context) error {
+	//         ctx := newContextImpl(c)
+	//         m(ctx)
+	//         return ctx.Error()
+	//     })
+	// }
 	return r
 }
 

@@ -105,42 +105,50 @@ func (r *RouterImpl) GET(path string, handlers ...HandlerFunc) Router {
 }
 
 func (r *RouterImpl) POST(path string, handlers ...HandlerFunc) Router {
+	r.addRouteMetadata("POST", path, handlers...)
 	r.group.Post(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
 func (r *RouterImpl) DELETE(path string, handlers ...HandlerFunc) Router {
+	r.addRouteMetadata("DELETE", path, handlers...)
 	r.group.Delete(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
 func (r *RouterImpl) PUT(path string, handlers ...HandlerFunc) Router {
+	r.addRouteMetadata("PUT", path, handlers...)
 	r.group.Put(path, r.wrapHandlers(handlers...)...)
 	return r
 }
-
 func (r *RouterImpl) PATCH(path string, handlers ...HandlerFunc) Router {
+	r.addRouteMetadata("PATCH", path, handlers...)
 	r.group.Patch(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
 func (r *RouterImpl) HEAD(path string, handlers ...HandlerFunc) Router {
+	r.addRouteMetadata("HEAD", path, handlers...)
 	r.group.Head(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
 func (r *RouterImpl) OPTIONS(path string, handlers ...HandlerFunc) Router {
+	r.addRouteMetadata("OPTIONS", path, handlers...)
 	r.group.Options(path, r.wrapHandlers(handlers...)...)
 	return r
 }
 
 func (r *RouterImpl) Static(prefix, root string) Router {
-	r.group.Get(prefix+"/*", staticHandler(root))
+	// You might want to record that this is a static endpoint.
+	r.addRouteMetadata("GET", prefix+"/*", nil) // or include handlers if appropriate
+	r.group.Get(prefix+"/*", staticHandler(prefix, root))
 	return r
 }
 
 func (r *RouterImpl) FileServer(path, root string) Router {
-	r.group.Get(path, staticHandler(root))
+	r.addRouteMetadata("GET", path, nil)
+	r.group.Get(path, staticHandler(path, root))
 	return r
 }
 
@@ -195,13 +203,22 @@ func (r *RouterImpl) wrapHandlers(handlers ...HandlerFunc) []routing.Handler {
 	return wrapped
 }
 
-func staticHandler(root string) routing.Handler {
+func staticHandler(prefix, root string) routing.Handler {
 	fs := &fasthttp.FS{
 		Root:            root,
 		IndexNames:      []string{"index.html"},
 		Compress:        true,
 		CompressBrotli:  true,
 		AcceptByteRange: true,
+		// Strip the prefix from the requested path.
+		PathRewrite: func(ctx *fasthttp.RequestCtx) []byte {
+			p := ctx.Request.URI().Path()
+			// Only rewrite if the path starts with the prefix.
+			if len(p) >= len(prefix) && string(p[:len(prefix)]) == prefix {
+				return p[len(prefix):]
+			}
+			return p
+		},
 	}
 	handler := fs.NewRequestHandler()
 	return func(c *routing.Context) error {
