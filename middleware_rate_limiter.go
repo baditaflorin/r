@@ -1,6 +1,7 @@
 package r
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
@@ -253,21 +254,27 @@ func (rl *defaultRateLimiter) Reset(key string) {
 }
 
 // cleanup periodically removes stale buckets.
-func (rl *defaultRateLimiter) cleanup() {
-	for range rl.cleanupTick.C {
-		rl.mu.Lock()
-		now := time.Now()
-		for key, bucket := range rl.buckets {
-			lastRefillTime := time.Unix(0, bucket.lastRefill.Load())
-			if now.Sub(lastRefillTime) > rl.per*2 {
-				delete(rl.buckets, key)
-				if rl.metrics != nil {
-					rl.metrics.IncrementCounter("rate_limiter.bucket_cleaned",
-						map[string]string{"key": key})
+func (rl *defaultRateLimiter) cleanup(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			// Context cancelled, exit the cleanup goroutine.
+			return
+		case <-rl.cleanupTick.C:
+			rl.mu.Lock()
+			now := time.Now()
+			for key, bucket := range rl.buckets {
+				lastRefillTime := time.Unix(0, bucket.lastRefill.Load())
+				if now.Sub(lastRefillTime) > rl.per*2 {
+					delete(rl.buckets, key)
+					if rl.metrics != nil {
+						rl.metrics.IncrementCounter("rate_limiter.bucket_cleaned",
+							map[string]string{"key": key})
+					}
 				}
 			}
+			rl.mu.Unlock()
 		}
-		rl.mu.Unlock()
 	}
 }
 
@@ -276,7 +283,7 @@ func (rl *defaultRateLimiter) cleanup() {
 // ==============================
 
 // NewDefaultRateLimiter creates a new rate limiter and starts its cleanup loop.
-func NewDefaultRateLimiter(reqs int, per time.Duration, opts ...RateLimiterOption) RateLimiter {
+func NewDefaultRateLimiter(ctx context.Context, reqs int, per time.Duration, opts ...RateLimiterOption) RateLimiter {
 	rl := &defaultRateLimiter{
 		tokens:      make(map[string]float64),
 		lastReq:     make(map[string]time.Time),
@@ -288,13 +295,12 @@ func NewDefaultRateLimiter(reqs int, per time.Duration, opts ...RateLimiterOptio
 		logger:      NewDefaultLogger(),
 		debugMode:   true,
 	}
-
-	// Apply options.
+	// Apply any options...
 	for _, opt := range opts {
 		opt(rl)
 	}
-
-	go rl.cleanup()
+	// Launch cleanup loop that will exit when ctx is cancelled.
+	go rl.cleanup(ctx)
 	return rl
 }
 

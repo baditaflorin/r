@@ -127,7 +127,8 @@ func (m *standardMiddleware) Logger(format string) MiddlewareFunc {
 
 func (m *standardMiddleware) RateLimit(reqs int, per time.Duration) MiddlewareFunc {
 	if m.rateLimiter == nil {
-		m.rateLimiter = NewDefaultRateLimiter(reqs, per)
+		// Use a long-lived context (for example, context.Background()).
+		m.rateLimiter = NewDefaultRateLimiter(context.Background(), reqs, per)
 	}
 
 	return func(c Context) {
