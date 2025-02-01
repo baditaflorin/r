@@ -42,9 +42,7 @@ func (c *wsConnection) processSendMessage(message []byte, ok bool, cfg wsConfig)
 // cleanupWritePump stops the ticker and rate limiter, then closes the connection.
 func (c *wsConnection) cleanupWritePump(ticker *time.Ticker) {
 	ticker.Stop()
-	if c.rateLimiter != nil {
-		c.rateLimiter.Stop()
-	}
+	// No need to stop c.rateLimiter since rate.Limiter does not require stopping.
 	c.Close()
 }
 

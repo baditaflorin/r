@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"github.com/fasthttp/websocket"
 	"github.com/google/uuid"
-	"runtime/debug"
+	"golang.org/x/time/rate"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,23 +14,6 @@ import (
 var (
 	defaultConnectionManager *ConnectionManager
 	once                     sync.Once
-)
-
-// Add a sync.Pool for WebSocket message buffers at the top of ws.go
-var wsMessagePool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 64*1024) // 64KB buffer for WebSocket messages
-	},
-}
-
-// Initialize the message pool (add this global variable at the top of ws.go)
-var (
-	messagePool = sync.Pool{
-		New: func() interface{} {
-			// Preallocate buffers of maximum expected message size
-			return make([]byte, 512*1024) // 512KB
-		},
-	}
 )
 
 // Update NewWSConn to properly initialize the connection
@@ -55,7 +38,7 @@ func NewWSConn(conn *websocket.Conn, logger Logger, handler WSHandler) *wsConnec
 		closeCh:     make(chan struct{}),
 		logger:      logger,
 		handler:     handler,
-		rateLimiter: time.NewTicker(time.Millisecond),
+		rateLimiter: rate.NewLimiter(rate.Every(time.Millisecond), 1),
 	}
 	wsConn.state.Store(wsStateActive)
 	wsConn.lastPing.Store(time.Now().UnixNano())
@@ -78,51 +61,6 @@ func NewWSConn(conn *websocket.Conn, logger Logger, handler WSHandler) *wsConnec
 	}
 
 	return wsConn
-}
-
-func (c *wsConnection) readPumpWithHandler(handler WSHandler) {
-	if c.logger == nil {
-		c.logger = NewDefaultLogger()
-	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			c.logger.Error("Panic in WebSocket handler",
-				"error", fmt.Sprintf("%v", r),
-				"stack", string(debug.Stack()),
-				"conn_id", c.id)
-		}
-		handler.OnClose(c)
-		c.Close()
-	}()
-
-	c.SetReadLimit(32 * 1024)
-	c.SetReadDeadline(time.Now().Add(60 * time.Second))
-	c.SetPongHandler(func(string) error {
-		c.SetReadDeadline(time.Now().Add(60 * time.Second))
-		c.lastPing.Store(time.Now().UnixNano())
-		return nil
-	})
-
-	for {
-		messageType, message, err := c.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err,
-				websocket.CloseGoingAway,
-				websocket.CloseAbnormalClosure) {
-				c.logger.Error("WebSocket read error",
-					"error", err,
-					"conn_id", c.id)
-			}
-			return
-		}
-
-		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
-			continue
-		}
-
-		handler.OnMessage(c, message)
-	}
 }
 
 // WSHandler defines the interface for WebSocket event handling
@@ -161,7 +99,7 @@ type wsConnection struct {
 	msgCount atomic.Uint64
 
 	writeBuffer   chan []byte
-	rateLimiter   *time.Ticker
+	rateLimiter   *rate.Limiter // <-- now using a rate.Limiter
 	readDeadline  time.Duration
 	writeDeadline time.Duration
 
@@ -184,43 +122,6 @@ const (
 	wsStateClosing = 1
 	wsStateClosed  = 2
 )
-
-// Update the existing newWSConnection function to use connection manager
-func newWSConnection(conn *websocket.Conn, logger Logger) *wsConnection {
-	// Initialize the connection manager if not already done
-	once.Do(func() {
-		defaultConnectionManager = NewConnectionManager(
-			10000, // Default max connections
-			NewDefaultMetricsCollector(),
-			logger,
-		)
-	})
-
-	wsConn := &wsConnection{
-		Conn:               conn,
-		id:                 uuid.New().String(),
-		send:               make(chan []byte, 256),
-		closeCh:            make(chan struct{}),
-		logger:             logger,
-		writeBuffer:        make(chan []byte, 1024),
-		rateLimiter:        time.NewTicker(time.Millisecond),
-		maxBufferSize:      1024,
-		dropMessagesOnFull: true,
-	}
-
-	// Add the connection to the manager
-	if err := defaultConnectionManager.Add(wsConn); err != nil {
-		if logger != nil {
-			logger.Error("Failed to add connection",
-				"error", err,
-				"conn_id", wsConn.id)
-		}
-		conn.Close()
-		return nil
-	}
-
-	return wsConn
-}
 
 func (c *wsConnection) ID() string {
 	return c.id
@@ -295,15 +196,6 @@ type MessageBuffer struct {
 	mu       sync.Mutex
 	notFull  chan struct{}
 	notEmpty chan struct{}
-}
-
-func NewMessageBuffer(size int) *MessageBuffer {
-	return &MessageBuffer{
-		buffer:   make([][]byte, size),
-		size:     size,
-		notFull:  make(chan struct{}, 1),
-		notEmpty: make(chan struct{}, 1),
-	}
 }
 
 func (b *MessageBuffer) Write(data []byte) error {
@@ -424,39 +316,6 @@ func (cm *ConnectionManager) GetActiveConnections() int32 {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	return cm.activeConns.Load()
-}
-
-func (cm *ConnectionManager) monitorConnection(conn *wsConnection) {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// Check connection health
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				cm.logger.Error("Connection health check failed",
-					"conn_id", conn.ID(),
-					"error", err)
-				conn.Close()
-				cm.Remove(conn)
-				return
-			}
-		case <-conn.closeCh:
-			cm.Remove(conn)
-			return
-		}
-	}
-}
-
-func ConfigureConnectionManager(maxConns int32, metrics MetricsCollector, logger Logger) {
-	if logger == nil {
-		logger = NewDefaultLogger()
-	}
-
-	once.Do(func() {
-		defaultConnectionManager = NewConnectionManager(maxConns, metrics, logger)
-	})
 }
 
 func GetConnectionStats() map[string]interface{} {

@@ -8,6 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/qiangxue/fasthttp-routing v0.0.0-20160225050629-6ccdc2a18d87
 	github.com/valyala/fasthttp v1.58.0
+	golang.org/x/time v0.0.0-20170424234030-8be79e1e0910
 )
 
 require (

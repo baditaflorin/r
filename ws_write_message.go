@@ -2,6 +2,7 @@
 package r
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
@@ -45,16 +46,17 @@ func (c *wsConnection) checkInitialization() error {
 	return nil
 }
 
-// sendMessageWithRateLimit tries to send the message by first waiting on the rate limiter.
 func (c *wsConnection) sendMessageWithRateLimit(data []byte) error {
+	// Create a context that times out after the connection's write deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), c.writeDeadline)
+	defer cancel()
+
 	// Wait for the rate limiter to allow sending.
-	select {
-	case <-c.rateLimiter.C:
-		return c.enqueueMessage(data)
-	default:
+	if err := c.rateLimiter.Wait(ctx); err != nil {
 		c.incrementDroppedCounter("rate_limited")
-		return ErrRateLimited
+		return err
 	}
+	return c.enqueueMessage(data)
 }
 
 // enqueueMessage attempts to queue the message into the write buffer with a short timeout.
