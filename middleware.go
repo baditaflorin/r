@@ -187,50 +187,6 @@ func (m *standardMiddleware) CORS(origins []string) MiddlewareFunc {
 	}
 }
 
-func handlePreflightRequest(c Context, origins []string) {
-	ctx := c.RequestCtx()
-	origin := string(ctx.Request.Header.Peek("Origin"))
-
-	// Check if origin is allowed
-	if !isOriginAllowed(origin, origins) {
-		return
-	}
-
-	// Set preflight response headers
-	headers := ctx.Response.Header
-	headers.Set("Access-Control-Allow-Origin", origin)
-	headers.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS")
-	headers.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Origin, X-Requested-With")
-	headers.Set("Access-Control-Allow-Credentials", "true")
-	headers.Set("Access-Control-Max-Age", "86400")
-
-	// Set status code and stop processing
-	ctx.SetStatusCode(204)
-}
-
-func handleSimpleRequest(c Context, origins []string) {
-	ctx := c.RequestCtx()
-	origin := string(ctx.Request.Header.Peek("Origin"))
-
-	if !isOriginAllowed(origin, origins) {
-		return
-	}
-
-	// Set simple response headers
-	headers := ctx.Response.Header
-	headers.Set("Access-Control-Allow-Origin", origin)
-	headers.Set("Access-Control-Allow-Credentials", "true")
-}
-
-func isOriginAllowed(origin string, allowedOrigins []string) bool {
-	for _, allowed := range allowedOrigins {
-		if allowed == "*" || allowed == origin {
-			return true
-		}
-	}
-	return false
-}
-
 func (m *standardMiddleware) RequestID() MiddlewareFunc {
 	return func(c Context) {
 		requestID := c.RequestID()
@@ -241,27 +197,6 @@ func (m *standardMiddleware) RequestID() MiddlewareFunc {
 		}
 		c.SetHeader("X-Request-ID", requestID)
 		c.Next()
-	}
-}
-
-// WithLogger sets a custom logger implementation
-func WithLogger(l Logger) MiddlewareOption {
-	return func(m *standardMiddleware) {
-		m.logger = l
-	}
-}
-
-// WithSecurity sets a custom security provider implementation
-func WithSecurity(s SecurityProvider) MiddlewareOption {
-	return func(m *standardMiddleware) {
-		m.security = s
-	}
-}
-
-// WithCORSConfig sets custom CORS configuration
-func WithCORSConfig(config *CORSConfig) MiddlewareOption {
-	return func(m *standardMiddleware) {
-		m.corsConfig = config
 	}
 }
 
