@@ -1,7 +1,6 @@
 package r
 
 import (
-	"encoding/json"
 	"fmt"
 	"github.com/fasthttp/websocket"
 	"github.com/qiangxue/fasthttp-routing"
@@ -312,79 +311,5 @@ func (r *RouterImpl) initializeIfNeeded() {
 	if r.routeMetrics == nil && r.router != nil {
 		// Initialize with default metrics collector if available
 		r.routeMetrics = NewDefaultMetricsCollector()
-	}
-}
-
-// Add this method to the RouterImpl struct in router.go
-// ServeHTTP handles incoming requests.
-func (r *RouterImpl) ServeHTTP(ctx *fasthttp.RequestCtx) {
-	// Create a new routing context wrapping the fasthttp.RequestCtx.
-	c := &routing.Context{RequestCtx: ctx}
-
-	// Create metrics tags.
-	tags := tagsPool.Get().(map[string]string)
-	tags["method"] = string(ctx.Method())
-	tags["path"] = string(ctx.Path())
-	defer func() {
-		// Clean up the map before returning it to the pool.
-		for k := range tags {
-			delete(tags, k)
-		}
-		tagsPool.Put(tags)
-	}()
-
-	// Record request start time.
-	start := time.Now()
-
-	// Handle panics.
-	defer func() {
-		if rcv := recover(); rcv != nil {
-			if r.panicHandler != nil {
-				impl := newContextImpl(c)
-				r.panicHandler(impl, rcv)
-			} else {
-				ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
-			}
-
-			if r.routeMetrics != nil {
-				r.routeMetrics.IncrementCounter("router.panic",
-					map[string]string{
-						"method": string(ctx.Method()),
-						"path":   string(ctx.Path()),
-					})
-			}
-		}
-
-		// Record request duration.
-		if r.routeMetrics != nil {
-			duration := time.Since(start)
-			r.routeMetrics.RecordTiming("router.request.duration",
-				duration,
-				tags)
-		}
-	}()
-
-	// Handle the request using the underlying router.
-	r.router.HandleRequest(ctx)
-
-	// Only override the 404 response if no custom NotFound handler is set.
-	if ctx.Response.StatusCode() == fasthttp.StatusNotFound && r.notFoundHandler == nil {
-		ctx.Response.Header.SetContentType("application/json")
-		jsonBody, err := json.Marshal(map[string]string{
-			"error": "route not found",
-			"path":  string(ctx.Request.URI().Path()),
-		})
-		if err != nil {
-			ctx.Error("Not Found", fasthttp.StatusNotFound)
-		} else {
-			ctx.Response.SetBody(jsonBody)
-		}
-	}
-
-	// Check for any error status codes for metrics.
-	if c.Response.StatusCode() >= 400 {
-		if r.routeMetrics != nil {
-			r.routeMetrics.IncrementCounter("router.error", tags)
-		}
 	}
 }
