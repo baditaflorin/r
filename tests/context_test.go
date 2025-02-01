@@ -203,3 +203,42 @@ func TestContext_AbortWithError(t *testing.T) {
 		t.Errorf("Expected status code 500, got %d", ctx.RequestCtx().Response.StatusCode())
 	}
 }
+
+func TestContext_Timeout_WithCancel(t *testing.T) {
+	ctx := createTestContext()
+	timeoutCtx, cancel := r.TestContextWithTimeout(ctx, 100*time.Millisecond)
+
+	// Test cancellation
+	cancel()
+	time.Sleep(50 * time.Millisecond) // Give some time for cancellation to propagate
+
+	if timeoutCtx.Err() == nil {
+		t.Error("Expected context to be cancelled")
+	}
+}
+
+func TestContext_SpanLifecycle(t *testing.T) {
+	ctx := createTestContext()
+
+	// Add a span
+	start := time.Now()
+	ctx.(*r.ContextImpl).AddSpan("operation", map[string]string{
+		"type": "test",
+	})
+
+	// Add another span
+	ctx.(*r.ContextImpl).AddSpan("another-operation", nil)
+
+	// End the first span
+	ctx.(*r.ContextImpl).EndSpan("operation")
+	_ = time.Since(start)
+
+	// Verify span count
+	spans := ctx.(*r.ContextImpl).GetSpans()
+	if len(spans) < 2 { // Should have at least root span + our spans
+		t.Errorf("Expected at least 2 spans, got %d", len(spans))
+	}
+
+	// Test cleaning up context
+	ctx.(*r.ContextImpl).Cleanup()
+}

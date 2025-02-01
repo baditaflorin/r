@@ -71,7 +71,7 @@ type ContextImpl struct {
 }
 
 type tracingSpan struct {
-	name      string
+	Name      string
 	startTime time.Time
 	endTime   time.Time
 	metadata  map[string]string
@@ -80,7 +80,7 @@ type tracingSpan struct {
 
 func (c *ContextImpl) AddSpan(name string, metadata map[string]string) {
 	span := &tracingSpan{
-		name:      name,
+		Name:      name,
 		startTime: time.Now(),
 		metadata:  metadata,
 	}
@@ -120,14 +120,14 @@ func newContextImpl(c *routing.Context) *ContextImpl {
 	// Ensure cleanup on context done
 	go func() {
 		<-ctx.Done()
-		impl.cleanup()
+		impl.Cleanup()
 		contextPool.Put(impl) // Return to pool for reuse
 	}()
 
 	return impl
 }
 
-func (c *ContextImpl) cleanup() {
+func (c *ContextImpl) Cleanup() {
 	// Ensure cancel is called
 	if c.cancel != nil {
 		c.cancel()
@@ -187,7 +187,7 @@ func (c *ContextImpl) cleanup() {
 
 func (c *ContextImpl) startSpan(name string, attributes map[string]string) *tracingSpan {
 	span := &tracingSpan{
-		name:      name,
+		Name:      name,
 		startTime: time.Now(),
 		metadata:  attributes,
 		children:  make([]*tracingSpan, 0),
@@ -384,7 +384,7 @@ func (c *ContextImpl) GetSpans() []*tracingSpan {
 
 func (c *ContextImpl) EndSpan(name string) {
 	for _, span := range c.spans {
-		if span.name == name && span.endTime.IsZero() {
+		if span.Name == name && span.endTime.IsZero() {
 			span.endTime = time.Now()
 
 			// Record span metrics
