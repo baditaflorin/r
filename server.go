@@ -23,7 +23,7 @@ type Server interface {
 	ServeHTTP(ctx *fasthttp.RequestCtx)
 }
 
-type serverImpl struct {
+type ServerImpl struct {
 	server   *fasthttp.Server
 	router   *RouterImpl
 	config   Config
@@ -44,7 +44,7 @@ type HealthCheck struct {
 	Interval time.Duration
 }
 
-func NewServer(config Config) *serverImpl {
+func NewServer(config Config) *ServerImpl {
 	if config.Handler == nil {
 		config.Handler = NewRouter()
 	}
@@ -52,7 +52,7 @@ func NewServer(config Config) *serverImpl {
 	// Create default logger if not provided
 	logger := NewDefaultLogger()
 
-	s := &serverImpl{
+	s := &ServerImpl{
 		router:           config.Handler.(*RouterImpl),
 		config:           config,
 		shutdown:         make(chan struct{}),
@@ -74,7 +74,7 @@ func NewServer(config Config) *serverImpl {
 	return s
 }
 
-func (s *serverImpl) BuildHandler() fasthttp.RequestHandler {
+func (s *ServerImpl) BuildHandler() fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
 		c := newRoutingContext(ctx)
 		reqCtx := newContextImpl(c)
@@ -95,7 +95,7 @@ func (s *serverImpl) BuildHandler() fasthttp.RequestHandler {
 	}
 }
 
-func (s *serverImpl) Start(address string) error {
+func (s *ServerImpl) Start(address string) error {
 	s.server = &fasthttp.Server{
 		Handler:            s.BuildHandler(),
 		ReadTimeout:        s.config.ReadTimeout,
@@ -110,7 +110,7 @@ func (s *serverImpl) Start(address string) error {
 	return s.server.ListenAndServe(address)
 }
 
-func (s *serverImpl) Stop() error {
+func (s *ServerImpl) Stop() error {
 	// Signal we're starting shutdown
 	s.logger.Info("Starting graceful shutdown")
 
@@ -217,21 +217,21 @@ func (s *serverImpl) Stop() error {
 	}
 }
 
-func (s *serverImpl) WithLogger(logger Logger) *serverImpl {
+func (s *ServerImpl) WithLogger(logger Logger) *ServerImpl {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.logger = logger
 	return s
 }
 
-func (s *serverImpl) WithMetricsCollector(collector MetricsCollector) *serverImpl {
+func (s *ServerImpl) WithMetricsCollector(collector MetricsCollector) *ServerImpl {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.metricsCollector = collector
 	return s
 }
 
-func (s *serverImpl) ServeHTTP(ctx *fasthttp.RequestCtx) {
+func (s *ServerImpl) ServeHTTP(ctx *fasthttp.RequestCtx) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error("Panic in request handler",

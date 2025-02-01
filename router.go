@@ -38,6 +38,7 @@ type RouterImpl struct {
 	group      *routing.RouteGroup
 	upgrader   websocket.FastHTTPUpgrader
 	middleware []HandlerFunc // Add this field to store middleware
+	logger     Logger
 
 	panicHandler            PanicHandlerFunc
 	methodNotAllowedHandler HandlerFunc

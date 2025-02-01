@@ -129,43 +129,40 @@ func (c *ContextImpl) Next() {
 }
 
 // WS implements Router.WS
+// File: router.go
+
+// Update the WS method in RouterImpl to properly handle WebSocket connections
 func (r *RouterImpl) WS(path string, handler WSHandler) Router {
+	if handler == nil {
+		panic("WebSocket handler cannot be nil")
+	}
+
 	r.group.Get(path, func(c *routing.Context) error {
-		var logger Logger
-		if l, ok := c.UserValue("logger").(Logger); ok {
-			logger = l
-		} else {
-			logger = NewDefaultLogger()
+		upgrader := websocket.FastHTTPUpgrader{
+			ReadBufferSize:    1024,
+			WriteBufferSize:   1024,
+			HandshakeTimeout:  10 * time.Second,
+			EnableCompression: true,
+			CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
+				return true // You might want to make this configurable
+			},
 		}
 
-		// Check if we can accept new connections
-		if defaultConnectionManager != nil &&
-			defaultConnectionManager.activeConns.Load() >= defaultConnectionManager.maxConns {
-			return fmt.Errorf("maximum WebSocket connections reached")
-		}
+		err := upgrader.Upgrade(c.RequestCtx, func(ws *websocket.Conn) {
+			wsConn := NewWSConn(ws, r.logger, handler)
+			defer wsConn.Close()
 
-		err := r.upgrader.Upgrade(c.RequestCtx, func(conn *websocket.Conn) {
-			wsConn := newWSConnection(conn, logger)
-			if wsConn == nil {
-				logger.Error("Failed to create WebSocket connection")
-				return
-			}
-
-			handler.OnConnect(wsConn)
-
-			go wsConn.readPumpWithConfig(handler, defaultWSConfig())
-			go wsConn.writePump()
+			// Block here until the connection is closed
+			<-wsConn.closeCh
 		})
 
 		if err != nil {
-			logger.Error("WebSocket upgrade failed",
-				"error", err,
-				"path", path,
-				"remote_addr", c.RemoteIP().String())
-			return err
+			return fmt.Errorf("websocket upgrade failed: %v", err)
 		}
+
 		return nil
 	})
+
 	return r
 }
 

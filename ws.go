@@ -33,6 +33,82 @@ var (
 	}
 )
 
+// Update NewWSConn to properly initialize the connection
+func NewWSConn(conn *websocket.Conn, logger Logger, handler WSHandler) *wsConnection {
+	if logger == nil {
+		logger = NewDefaultLogger()
+	}
+
+	wsConn := &wsConnection{
+		Conn:    conn,
+		id:      uuid.New().String(),
+		send:    make(chan []byte, 256),
+		closeCh: make(chan struct{}),
+		logger:  logger,
+		handler: handler, // Store the handler
+	}
+
+	// Set initial state
+	wsConn.state.Store(wsStateActive)
+	wsConn.lastPing.Store(time.Now().UnixNano())
+
+	// Start the read and write pumps
+	go wsConn.readPump()
+	go wsConn.writePump()
+
+	// Call OnConnect after pumps are started
+	if handler != nil {
+		handler.OnConnect(wsConn)
+	}
+
+	return wsConn
+}
+
+func (c *wsConnection) readPumpWithHandler(handler WSHandler) {
+	if c.logger == nil {
+		c.logger = NewDefaultLogger()
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("Panic in WebSocket handler",
+				"error", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()),
+				"conn_id", c.id)
+		}
+		handler.OnClose(c)
+		c.Close()
+	}()
+
+	c.SetReadLimit(32 * 1024)
+	c.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.SetPongHandler(func(string) error {
+		c.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.lastPing.Store(time.Now().UnixNano())
+		return nil
+	})
+
+	for {
+		messageType, message, err := c.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err,
+				websocket.CloseGoingAway,
+				websocket.CloseAbnormalClosure) {
+				c.logger.Error("WebSocket read error",
+					"error", err,
+					"conn_id", c.id)
+			}
+			return
+		}
+
+		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
+			continue
+		}
+
+		handler.OnMessage(c, message)
+	}
+}
+
 // WSHandler defines the interface for WebSocket event handling
 type WSHandler interface {
 	OnConnect(conn WSConnection)
@@ -60,16 +136,26 @@ type wsConnection struct {
 	logger    Logger
 	closeOnce sync.Once
 	metrics   MetricsCollector
+	mu        sync.Mutex
 
 	// Add connection state tracking
 	state    atomic.Int32
 	lastPing atomic.Int64
 	msgCount atomic.Uint64
 
-	writeBuffer        chan []byte
-	rateLimiter        *time.Ticker
-	maxBufferSize      int
+	writeBuffer   chan []byte
+	rateLimiter   *time.Ticker
+	readDeadline  time.Duration
+	writeDeadline time.Duration
+
+	maxBufferSize    int
+	maxMessageSize   int64
+	compressionLevel int
+
 	dropMessagesOnFull bool
+
+	handler          WSHandler // Add handler reference
+	messageValidator func([]byte) error
 }
 
 const (
@@ -142,60 +228,52 @@ func defaultWSConfig() wsConfig {
 	}
 }
 
-func (c *wsConnection) readPump(handler WSHandler) {
-	// Use default configuration
-	c.readPumpWithConfig(handler, defaultWSConfig())
-}
-
-func (c *wsConnection) readPumpWithConfig(handler WSHandler, config wsConfig) {
+func (c *wsConnection) readPump() {
 	defer func() {
 		if r := recover(); r != nil {
-			c.logger.WithFields(map[string]interface{}{
-				"error":     fmt.Sprintf("%v", r),
-				"client_id": c.ID(),
-				"stack":     string(debug.Stack()),
-			}).Error("Panic in WebSocket handler")
+			c.logger.Error("Panic in WebSocket read pump",
+				"error", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()),
+				"conn_id", c.id)
 		}
-		handler.OnClose(c)
 		c.Close()
 	}()
 
-	c.SetReadLimit(config.MessageSize)
-	c.SetReadDeadline(time.Now().Add(config.PongWait))
-	c.SetPongHandler(func(string) error {
-		c.SetReadDeadline(time.Now().Add(config.PongWait))
-		return nil
-	})
+	c.SetReadLimit(32 * 1024)
+	c.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 	for {
-		// ReadMessage returns the messageType and message bytes
-		_, message, err := c.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err,
-				websocket.CloseGoingAway,
-				websocket.CloseAbnormalClosure,
-				websocket.CloseNoStatusReceived) {
-				c.logger.WithFields(map[string]interface{}{
-					"error":     err,
-					"client_id": c.ID(),
-				}).Error("WebSocket read error")
-			}
+		select {
+		case <-c.closeCh:
 			return
+		default:
+			messageType, message, err := c.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err,
+					websocket.CloseGoingAway,
+					websocket.CloseAbnormalClosure) {
+					c.logger.Error("WebSocket read error",
+						"error", err,
+						"conn_id", c.id)
+				}
+				return
+			}
+
+			// Process the message regardless of whether it's empty
+			if messageType == websocket.TextMessage || messageType == websocket.BinaryMessage {
+				// Make a copy of the message
+				msgCopy := make([]byte, len(message))
+				copy(msgCopy, message)
+
+				// Call handler with the message copy
+				if c.handler != nil {
+					c.handler.OnMessage(c, msgCopy)
+				}
+			}
 		}
-
-		// Get a buffer from the pool
-		buf := wsMessagePool.Get().([]byte)
-		buf = append(buf[:0], message...) // Copy message into the pooled buffer
-
-		// Handle the message
-		handler.OnMessage(c, buf[:len(message)])
-
-		// Return the buffer to the pool
-		wsMessagePool.Put(buf)
 	}
 }
 
-// writePump handles outgoing WebSocket messages
 func (c *wsConnection) writePump() {
 	ticker := time.NewTicker(54 * time.Second)
 	defer func() {
@@ -205,30 +283,29 @@ func (c *wsConnection) writePump() {
 
 	for {
 		select {
-		case <-ticker.C:
-			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+		case message, ok := <-c.send:
+			if !ok {
+				c.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
+
+			c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			err := c.WriteMessage(websocket.TextMessage, message)
+			if err != nil {
+				c.logger.Error("Write error",
+					"error", err,
+					"conn_id", c.id)
+				return
+			}
+
+		case <-ticker.C:
+			c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+
 		case <-c.closeCh:
 			return
-		default:
-			// Try to read from buffer
-			select {
-			case msg := <-c.writeBuffer:
-				if err := c.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-					c.logger.Error("Failed to write WebSocket message",
-						"error", err,
-						"conn_id", c.id,
-					)
-					return
-				}
-
-				if c.metrics != nil {
-					c.metrics.IncrementCounter("ws.messages.sent", map[string]string{
-						"conn_id": c.id,
-					})
-				}
-			}
 		}
 	}
 }
@@ -236,27 +313,22 @@ func (c *wsConnection) writePump() {
 func (c *wsConnection) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
+		// Mark connection as closing
 		c.state.Store(wsStateClosing)
-		close(c.closeCh)
-		err = c.Conn.Close()
-		c.state.Store(wsStateClosed)
 
-		// Remove from connection manager
-		defaultConnectionManager.Remove(c)
-
-		// Record metrics
-		if c.metrics != nil {
-			c.metrics.IncrementCounter("ws.connections.closed",
-				map[string]string{
-					"conn_id": c.id,
-				})
-			c.metrics.RecordTiming("ws.connection.duration",
-				time.Since(time.Unix(0, c.lastPing.Load())),
-				map[string]string{
-					"conn_id":     c.id,
-					"remote_addr": c.RemoteAddr(),
-				})
+		// Notify handler before closing
+		if c.handler != nil {
+			c.handler.OnClose(c)
 		}
+
+		// Close the close channel to stop pumps
+		close(c.closeCh)
+
+		// Close the underlying connection
+		err = c.Conn.Close()
+
+		// Mark as fully closed
+		c.state.Store(wsStateClosed)
 	})
 	return err
 }
@@ -406,53 +478,57 @@ type ConnectionManager struct {
 	logger      Logger
 	maxConns    int32
 	activeConns atomic.Int32
+	mu          sync.RWMutex
 }
 
 func NewConnectionManager(maxConns int32, metrics MetricsCollector, logger Logger) *ConnectionManager {
-	if logger == nil {
-		logger = NewDefaultLogger()
-	}
-
-	cm := &ConnectionManager{
+	return &ConnectionManager{
 		maxConns: maxConns,
 		metrics:  metrics,
 		logger:   logger,
 	}
-
-	// Start periodic cleanup
-	go cm.periodicCleanup()
-	return cm
 }
 
 func (cm *ConnectionManager) Add(conn *wsConnection) error {
-	if cm.activeConns.Load() >= cm.maxConns {
-		if cm.metrics != nil {
-			cm.metrics.IncrementCounter("ws.connections.rejected",
-				map[string]string{"reason": "max_connections_reached"})
-		}
-		return fmt.Errorf("maximum connections reached")
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	currentConns := cm.activeConns.Load()
+	if currentConns >= cm.maxConns {
+		return fmt.Errorf("connection limit reached")
 	}
 
+	// Add connection first
 	cm.connections.Store(conn.ID(), conn)
-	count := cm.activeConns.Add(1)
+
+	// Then increment counter
+	cm.activeConns.Add(1)
 
 	if cm.metrics != nil {
-		cm.metrics.RecordValue("ws.connections.active", float64(count), nil)
-		cm.metrics.IncrementCounter("ws.connections.total", nil)
+		cm.metrics.RecordValue("ws.connections.active",
+			float64(cm.activeConns.Load()), nil)
 	}
 
-	// Start connection monitoring
-	go cm.monitorConnection(conn)
 	return nil
 }
 
 func (cm *ConnectionManager) Remove(conn *wsConnection) {
-	cm.connections.Delete(conn.ID())
-	count := cm.activeConns.Add(-1)
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 
-	if cm.metrics != nil {
-		cm.metrics.RecordValue("ws.connections.active", float64(count), nil)
+	if _, exists := cm.connections.LoadAndDelete(conn.ID()); exists {
+		newCount := cm.activeConns.Add(-1)
+		if cm.metrics != nil {
+			cm.metrics.RecordValue("ws.connections.active",
+				float64(newCount), nil)
+		}
 	}
+}
+
+func (cm *ConnectionManager) GetActiveConnections() int32 {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.activeConns.Load()
 }
 
 func (cm *ConnectionManager) monitorConnection(conn *wsConnection) {
@@ -505,6 +581,10 @@ func (cm *ConnectionManager) periodicCleanup() {
 }
 
 func ConfigureConnectionManager(maxConns int32, metrics MetricsCollector, logger Logger) {
+	if logger == nil {
+		logger = NewDefaultLogger()
+	}
+
 	once.Do(func() {
 		defaultConnectionManager = NewConnectionManager(maxConns, metrics, logger)
 	})
