@@ -1,9 +1,11 @@
 package r
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/fasthttp/websocket"
 	"github.com/google/uuid"
+	"io"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -239,39 +241,84 @@ func (c *wsConnection) readPump() {
 		c.Close()
 	}()
 
-	c.SetReadLimit(32 * 1024)
+	c.SetReadLimit(10 * 1024 * 1024) // 10MB max message size
 	c.SetReadDeadline(time.Now().Add(60 * time.Second))
 
+	c.SetPongHandler(func(string) error {
+		c.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
 	for {
-		select {
-		case <-c.closeCh:
+		messageType, reader, err := c.NextReader()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err,
+				websocket.CloseGoingAway,
+				websocket.CloseAbnormalClosure) {
+				c.logger.Error("WebSocket read error",
+					"error", err,
+					"conn_id", c.id)
+			}
 			return
-		default:
-			messageType, message, err := c.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err,
-					websocket.CloseGoingAway,
-					websocket.CloseAbnormalClosure) {
-					c.logger.Error("WebSocket read error",
-						"error", err,
-						"conn_id", c.id)
-				}
-				return
-			}
+		}
 
-			// Process the message regardless of whether it's empty
-			if messageType == websocket.TextMessage || messageType == websocket.BinaryMessage {
-				// Make a copy of the message
-				msgCopy := make([]byte, len(message))
-				copy(msgCopy, message)
+		// Set up a limited reader to prevent memory exhaustion
+		limitedReader := io.LimitReader(reader, 10*1024*1024+1) // 10MB + 1 byte to detect overflow
 
-				// Call handler with the message copy
-				if c.handler != nil {
-					c.handler.OnMessage(c, msgCopy)
-				}
+		// Use a buffer to read the message
+		buf := &bytes.Buffer{}
+		written, err := io.Copy(buf, limitedReader)
+
+		if err != nil {
+			c.logger.Error("Failed to read message",
+				"error", err,
+				"conn_id", c.id)
+			c.handleMessageError("Failed to read message")
+			return
+		}
+
+		// Check if message exceeds size limit
+		if written > 10*1024*1024 {
+			c.logger.Error("Message size exceeds limit",
+				"size", written,
+				"conn_id", c.id)
+			c.handleMessageError("Message size exceeds maximum allowed size of 10MB")
+			return
+		}
+
+		// Process valid message
+		if messageType == websocket.TextMessage || messageType == websocket.BinaryMessage {
+			message := buf.Bytes()
+			msgCopy := make([]byte, len(message))
+			copy(msgCopy, message)
+
+			if c.handler != nil {
+				c.handler.OnMessage(c, msgCopy)
 			}
+			c.msgCount.Add(1)
 		}
 	}
+}
+
+func (c *wsConnection) handleMessageError(msg string) {
+	// Send error message to client
+	closeMsg := websocket.FormatCloseMessage(
+		websocket.CloseMessageTooBig,
+		msg,
+	)
+	c.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(time.Second))
+
+	// Notify handler of error if implemented
+	if errHandler, ok := c.handler.(WSErrorHandler); ok {
+		errHandler.OnError(c, fmt.Errorf(msg))
+	}
+
+	// Close the connection
+	c.Close()
+}
+
+type WSErrorHandler interface {
+	OnError(conn WSConnection, err error)
 }
 
 func (c *wsConnection) writePump() {

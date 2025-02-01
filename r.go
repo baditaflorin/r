@@ -128,27 +128,28 @@ func (c *ContextImpl) Next() {
 	}
 }
 
-// WS implements Router.WS
-// File: router.go
-
-// Update the WS method in RouterImpl to properly handle WebSocket connections
+// Update the WS method in RouterImpl to handle large messages
 func (r *RouterImpl) WS(path string, handler WSHandler) Router {
 	if handler == nil {
 		panic("WebSocket handler cannot be nil")
 	}
 
 	r.group.Get(path, func(c *routing.Context) error {
+		// Configure upgrader with larger buffer sizes
 		upgrader := websocket.FastHTTPUpgrader{
-			ReadBufferSize:    1024,
-			WriteBufferSize:   1024,
+			ReadBufferSize:    1024 * 1024, // 1MB read buffer
+			WriteBufferSize:   1024 * 1024, // 1MB write buffer
 			HandshakeTimeout:  10 * time.Second,
 			EnableCompression: true,
 			CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
-				return true // You might want to make this configurable
+				return true
 			},
 		}
 
 		err := upgrader.Upgrade(c.RequestCtx, func(ws *websocket.Conn) {
+			// Set larger message size limit
+			ws.SetReadLimit(10 * 1024 * 1024) // 10MB max message size
+
 			wsConn := NewWSConn(ws, r.logger, handler)
 			defer wsConn.Close()
 

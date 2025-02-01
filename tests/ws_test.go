@@ -16,26 +16,43 @@ type testWSHandler struct {
 	connectCalled   bool
 	messageReceived []byte
 	closeCalled     bool
+	messageCount    int      // Add counter for concurrent test
+	errorReceived   bool     // New field for tracking errors
+	messages        [][]byte // Store all messages for verification
 	mu              sync.Mutex
 	t               *testing.T
 }
 
 func newTestHandler(t *testing.T) *testWSHandler {
-	return &testWSHandler{t: t}
+	return &testWSHandler{
+		t:        t,
+		messages: make([][]byte, 0),
+	}
 }
 
 func (h *testWSHandler) OnMessage(conn r.WSConnection, msg []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.t.Logf("OnMessage called with message of length: %d", len(msg))
-
-	// Always store the message, even if empty
+	// Store the message
 	h.messageReceived = make([]byte, len(msg))
 	copy(h.messageReceived, msg)
 
+	// Add to messages slice
+	msgCopy := make([]byte, len(msg))
+	copy(msgCopy, msg)
+	h.messages = append(h.messages, msgCopy)
+
+	// Increment message count
+	h.messageCount++
+
+	h.t.Logf("OnMessage called with message length: %d", len(msg))
 	if len(msg) > 0 {
-		h.t.Logf("Message content (hex): %x", msg)
+		if len(msg) > 100 {
+			h.t.Logf("Message too large to log, first 100 bytes: %x", msg[:100])
+		} else {
+			h.t.Logf("Message content: %x", msg)
+		}
 	}
 }
 
@@ -233,4 +250,11 @@ func TestWebSocket_EmptyMessage(t *testing.T) {
 	} else {
 		t.Logf("Received message length: %d", len(handler.messageReceived))
 	}
+}
+
+func (h *testWSHandler) OnError(conn r.WSConnection, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.errorReceived = true
+	h.t.Logf("WebSocket error received: %v", err)
 }
