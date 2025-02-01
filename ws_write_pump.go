@@ -16,22 +16,26 @@ func (c *wsConnection) writePump() {
 	for {
 		select {
 		case message, ok := <-c.send:
-			if !ok {
-				c.handleSendChannelClosed(cfg)
-				return
-			}
-			if err := c.handleOutgoingMessage(message, cfg); err != nil {
-				return
-			}
-
+			c.processSendMessage(message, ok, cfg)
 		case <-ticker.C:
-			if err := c.handlePing(cfg); err != nil {
+			if err := c.sendPing(cfg); err != nil {
 				return
 			}
-
 		case <-c.closeCh:
 			return
 		}
+	}
+}
+
+// processSendMessage processes messages received on the send channel.
+func (c *wsConnection) processSendMessage(message []byte, ok bool, cfg wsConfig) {
+	if !ok {
+		c.sendCloseMessage(cfg)
+		return
+	}
+	if err := c.sendOutgoingMessage(message, cfg); err != nil {
+		// If sending fails, you may choose to perform additional error handling here.
+		return
 	}
 }
 
@@ -44,9 +48,9 @@ func (c *wsConnection) cleanupWritePump(ticker *time.Ticker) {
 	c.Close()
 }
 
-// handleSendChannelClosed is called when the send channel is closed.
+// sendCloseMessage is called when the send channel is closed.
 // It sends a close control message to the client.
-func (c *wsConnection) handleSendChannelClosed(cfg wsConfig) {
+func (c *wsConnection) sendCloseMessage(cfg wsConfig) {
 	deadline := time.Now().Add(cfg.WriteTimeout)
 	err := c.WriteControl(
 		websocket.CloseMessage,
@@ -58,8 +62,8 @@ func (c *wsConnection) handleSendChannelClosed(cfg wsConfig) {
 	}
 }
 
-// handleOutgoingMessage writes an outgoing message to the WebSocket client.
-func (c *wsConnection) handleOutgoingMessage(message []byte, cfg wsConfig) error {
+// sendOutgoingMessage writes an outgoing message to the WebSocket client.
+func (c *wsConnection) sendOutgoingMessage(message []byte, cfg wsConfig) error {
 	deadline := time.Now().Add(cfg.WriteTimeout)
 	c.SetWriteDeadline(deadline)
 	if err := c.WriteMessage(websocket.TextMessage, message); err != nil {
@@ -69,8 +73,8 @@ func (c *wsConnection) handleOutgoingMessage(message []byte, cfg wsConfig) error
 	return nil
 }
 
-// handlePing sends a ping message to the client.
-func (c *wsConnection) handlePing(cfg wsConfig) error {
+// sendPing sends a ping message to the client.
+func (c *wsConnection) sendPing(cfg wsConfig) error {
 	deadline := time.Now().Add(cfg.WriteTimeout)
 	c.SetWriteDeadline(deadline)
 	if err := c.WriteMessage(websocket.PingMessage, nil); err != nil {
